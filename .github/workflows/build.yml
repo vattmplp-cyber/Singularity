@@ -68,15 +68,13 @@ jobs:
         cd edk2
         . edksetup.sh
         
-        # 1. Повний фікс конфігурації: міняємо GCC5 на сучасний GCC у файлі конфігурації самого проекту
+        # 1. Повний фікс конфігурації: міняємо застарілий GCC5 на сучасний GCC у файлі конфігурації самого проекту
         sed -i 's/SUPPORTED_TOOL_CHAIN_TAGS  = GCC5/SUPPORTED_TOOL_CHAIN_TAGS  = GCC/g' SingularityPkg/SingularityPkg.dsc || true
         sed -i 's/GCC5/GCC/g' SingularityPkg/SingularityPkg.dsc || true
         
-        # 2. Вимикаємо суворе ставлення до попереджень (-Werror), щоб дрібні нестиковки коду автора не викликали краш збірки на Linux
-        sed -i 's/DEFINE GCC_ALL_CC_FLAGS            = -g -Os -fshort-wchar -fno-builtin -fno-strict-aliasing -Wall -Werror/DEFINE GCC_ALL_CC_FLAGS            = -g -Os -fshort-wchar -fno-builtin -fno-strict-aliasing -Wall -Wno-error/g' Conf/tools_def.txt || true
-        
-        # 3. ФІКС КОМПІЛЯТОРА LINUX: додаємо дефайни для __stdcall та __fastcall, щоб gcc розумів Windows-код автора
-        sed -i 's/DEFINE GCC_ALL_CC_FLAGS            = /DEFINE GCC_ALL_CC_FLAGS            = -D__stdcall= -D__fastcall= /g' Conf/tools_def.txt || true
+        # 2. ПРИМУСОВИЙ ФІКС МАКРОСІВ: записуємо дефайни для __stdcall та __fastcall прямо в блок збірки самого проекту (.dsc)
+        # Це гарантує, що компілятор затре Windows-специфічні виклики автора без модифікації файлів самого EDK2.
+        echo -e "\n[BuildOptions]\n  GCC:*_*_*_CC_FLAGS = -D__stdcall= -D__fastcall= -Wno-error" >> SingularityPkg/SingularityPkg.dsc
 
         # Запускаємо збірку з нативним сучасним компілятором системи
         build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC -b RELEASE
