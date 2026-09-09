@@ -1,0 +1,74 @@
+name: Build Singularity Project
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch: # Дозволяє запускати збірку вручну кнопкою
+
+jobs:
+  # --- Потокова задача 1: Збірка Usermode Мапера ---
+  build-mapper:
+    runs-on: windows-2022
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build Mapper
+      run: |
+        msbuild DriverMapper/DriverMapper.vcxproj /p:Configuration=Release /p:Platform=x64
+
+    - name: Upload Mapper Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Singularity-Mapper-Exe
+        path: DriverMapper/x64/Release/DriverMapper.exe
+
+  # --- Потокова задача 2: Збірка UEFI DXE Драйвера за допомогою EDK2 ---
+  build-uefi-driver:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout Singularity
+      uses: actions/checkout@v4
+      with:
+        path: singularity-repo
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential uuid-dev iasl nasm Python3
+
+    - name: Checkout EDK2 (Tianocore)
+      uses: actions/checkout@v4
+      with:
+        repository: tianocore/edk2
+        submodules: 'true'
+        path: edk2
+
+    - name: Setup EDK2 Environment & Build BaseTools
+      run: |
+        cd edk2
+        make -C BaseTools
+        . edksetup.sh
+
+    - name: Integrate SingularityPkg into EDK2
+      run: |
+        # Копіюємо папку пакета з вашого репозиторію в корінь EDK2
+        cp -r singularity-repo/SingularityPkg edk2/
+
+    - name: Build UEFI Driver (.efi)
+      run: |
+        cd edk2
+        . edksetup.sh
+        # Запускаємо офіційну збірку через EDK2 build tool
+        build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC5 -b RELEASE
+
+    - name: Upload UEFI Driver Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Singularity-DXE-Driver
+        path: edk2/Build/SingularityPkg/RELEASE_GCC5/X64/SingularityDxe.efi
