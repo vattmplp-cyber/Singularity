@@ -15,12 +15,19 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v1
+
+    - name: Navigate to workspace and Restore NuGet Packages
+      run: |
+        nuget restore DriverMapper.slnx
+
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
 
-    - name: Build Mapper
+    - name: Build Solution
       run: |
-        msbuild DriverMapper/Mapper.vcxproj /p:Configuration=Release /p:Platform=x64
+        msbuild DriverMapper.slnx /p:Configuration=Release /p:Platform=x64
 
     - name: Upload Mapper Artifact
       uses: actions/upload-artifact@v4
@@ -63,10 +70,11 @@ jobs:
       run: |
         cd edk2
         . edksetup.sh
-        build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC5 -b RELEASE
+        # Змінено тулчейн з GCC5 на універсальний GCC
+        build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC -b RELEASE
 
     - name: Upload UEFI Driver Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Singularity-DXE-Driver
-        path: edk2/Build/SingularityPkg/RELEASE_GCC5/X64/SingularityDxe.efi
+        path: edk2/Build/SingularityPkg/RELEASE_GCC/X64/SingularityDxe.efi
