@@ -20,18 +20,20 @@ jobs:
 
     - name: Restore NuGet Packages via MSBuild
       run: |
-        # Використовуємо нативний механізм MSBuild для відновлення нових .slnx рішень
-        msbuild DriverMapper.slnx /t:restore /p:Configuration=Release /p:Platform=x64
+        # Запускаємо відновлення з правильним шляхом до папки DriverMapper
+        msbuild DriverMapper/DriverMapper.slnx /t:restore /p:Configuration=Release /p:Platform=x64
 
     - name: Build Solution
       run: |
-        msbuild DriverMapper.slnx /p:Configuration=Release /p:Platform=x64
+        # Збираємо мапер за правильним шляхом
+        msbuild DriverMapper/DriverMapper.slnx /p:Configuration=Release /p:Platform=x64
 
     - name: Upload Mapper Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Singularity-Mapper-Exe
-        path: DriverMapper/x64/Release/Mapper.exe
+        # Шлях до скомпільованого бінарника мапера всередині вихідної папки
+        path: DriverMapper/x64/Release/mapper.exe
 
   # --- Задача 2: Збірка UEFI DXE Драйвера (.efi) за допомогою EDK2 ---
   build-uefi-driver:
@@ -68,10 +70,13 @@ jobs:
       run: |
         cd edk2
         . edksetup.sh
-        build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC -b RELEASE
+        # Створюємо мапінг сумісності для нових версій EDK2, де GCC5 замінено на GCC
+        sed -i 's/DEFINE GCC5_BIN_PREFIX       = \/usr\/bin\//DEFINE GCC5_BIN_PREFIX       = \/usr\/bin\/gcc-/g' Conf/tools_def.txt || true
+        # Збираємо драйвер через нативний компілятор Linux
+        build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC5 -b RELEASE
 
     - name: Upload UEFI Driver Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Singularity-DXE-Driver
-        path: edk2/Build/SingularityPkg/RELEASE_GCC/X64/SingularityDxe.efi
+        path: edk2/Build/SingularityPkg/RELEASE_GCC5/X64/SingularityDxe.efi
