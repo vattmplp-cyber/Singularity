@@ -75,6 +75,9 @@ jobs:
         # 2. Вимикаємо суворе ставлення до попереджень (-Werror), щоб дрібні нестиковки коду автора не викликали краш збірки на Linux
         sed -i 's/DEFINE GCC_ALL_CC_FLAGS            = -g -Os -fshort-wchar -fno-builtin -fno-strict-aliasing -Wall -Werror/DEFINE GCC_ALL_CC_FLAGS            = -g -Os -fshort-wchar -fno-builtin -fno-strict-aliasing -Wall -Wno-error/g' Conf/tools_def.txt || true
         
+        # 3. ФІКС КОМПІЛЯТОРА LINUX: додаємо дефайни для __stdcall та __fastcall, щоб gcc розумів Windows-код автора
+        sed -i 's/DEFINE GCC_ALL_CC_FLAGS            = /DEFINE GCC_ALL_CC_FLAGS            = -D__stdcall= -D__fastcall= /g' Conf/tools_def.txt || true
+
         # Запускаємо збірку з нативним сучасним компілятором системи
         build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC -b RELEASE
 
