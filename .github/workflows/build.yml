@@ -30,7 +30,8 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Singularity-Mapper-Exe
-        path: DriverMapper/x64/Release/mapper.exe
+        # Виправлено шлях до файлу відповідно до логів вашої успішної збірки!
+        path: DriverMapper/build/x64/Release/mapper.exe
 
   # --- Задача 2: Збірка UEFI DXE Драйвера (.efi) за допомогою EDK2 ---
   build-uefi-driver:
@@ -67,9 +68,10 @@ jobs:
       run: |
         cd edk2
         . edksetup.sh
-        # Системний фікс: міняємо жорстко прописаний тулчейн GCC5 на сучасний універсальний GCC у файлі конфігурації самого проекту
+        # Повний фікс конфігурації: примусово міняємо GCC5 на сучасний GCC у всіх конфігах проекту
         sed -i 's/SUPPORTED_TOOL_CHAIN_TAGS  = GCC5/SUPPORTED_TOOL_CHAIN_TAGS  = GCC/g' SingularityPkg/SingularityPkg.dsc || true
-        # Запускаємо збірку з нативним прапором GCC
+        sed -i 's/GCC5/GCC/g' SingularityPkg/SingularityPkg.dsc || true
+        # Запускаємо збірку з нативним сучасним компілятором системи
         build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC -b RELEASE
 
     - name: Upload UEFI Driver Artifact
