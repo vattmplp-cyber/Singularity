@@ -15,15 +15,13 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Setup NuGet
-      uses: NuGet/setup-nuget@v1
-
-    - name: Navigate to workspace and Restore NuGet Packages
-      run: |
-        nuget restore DriverMapper.slnx
-
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+
+    - name: Restore NuGet Packages via MSBuild
+      run: |
+        # Використовуємо нативний механізм MSBuild для відновлення нових .slnx рішень
+        msbuild DriverMapper.slnx /t:restore /p:Configuration=Release /p:Platform=x64
 
     - name: Build Solution
       run: |
@@ -70,7 +68,6 @@ jobs:
       run: |
         cd edk2
         . edksetup.sh
-        # Змінено тулчейн з GCC5 на універсальний GCC
         build -p SingularityPkg/SingularityPkg.dsc -a X64 -t GCC -b RELEASE
 
     - name: Upload UEFI Driver Artifact
