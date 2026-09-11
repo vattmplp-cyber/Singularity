@@ -43,7 +43,7 @@ EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL          *gTextInputEx = NULL;
 DummyProtocolData                          gSingularityDriverProtocol = { 0 };
 
 static EFI_SET_VARIABLE oSetVariable = NULL;
-// ФІКС: Оголошуємо покажчик для збереження оригінального сервісу читання BIOS
+// Наш новий покажчик на оригінальне пасивне читання змінних плати
 static EFI_GET_VARIABLE oGetVariable = NULL;
 
 static EFI_EVENT NotifyEvent = NULL;
@@ -61,7 +61,7 @@ typedef struct _MemoryCommand
 {
     int magic;
     int operation;
-    unsigned long long data[10];
+    unsigned long long data[10]; // Залізобетонно відновлений оригінальний масив
     int size;
 } MemoryCommand;
 
@@ -84,6 +84,7 @@ RunCommand(MemoryCommand* cmd)
               cmd->operation, cmd->size,
               (UINT64)cmd->data[0], (UINT64)cmd->data[1]);
 
+    // 0: memcpy(dst, src, size) - Індекси 0 та 1 на місці!
     if (cmd->operation == 0) {
         if (cmd->size <= 0 || cmd->size > 0x1000000) {
             SerialPrintSafe("SingularityDxe: op0 invalid size %d\r\n", cmd->size);
@@ -98,6 +99,7 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
+    // 1: report DriverBuffer address back via cmd->data[3]
     if (cmd->operation == 1) {
         if (cmd->data[2] == 0 || cmd->data[2] > DRIVER_SIZE) {
             SerialPrintSafe("SingularityDxe: op1 invalid request size %lu\r\n",
@@ -113,7 +115,7 @@ RunCommand(MemoryCommand* cmd)
         }
         return EFI_SUCCESS;
     }
-  
+
 // 3: call __stdcall void() inside DriverBuffer
     if (cmd->operation == 3) {
         UINTN target = (UINTN)cmd->data[0];
@@ -163,7 +165,7 @@ RunCommand(MemoryCommand* cmd)
     return EFI_UNSUPPORTED;
 }
 
-// ДОСКОНАЛИЙ ФІКС: Наш новий обробник для безпечного Usermode Get-каналу (без привілеїв Windows)
+// ДОСКОНАЛИЙ ФІКС: Пасивний обробник GetVariable для обходу помилки 1314
 EFI_STATUS
 EFIAPI
 HookedGetVariable (
@@ -190,7 +192,6 @@ HookedGetVariable (
             }
         }
     }
-    // Якщо це звичайний системний запит Windows — м'яко пропускаємо через оригінал
     return oGetVariable(VariableName, VendorGuid, Attributes, DataSize, Data);
 }
 
@@ -242,7 +243,6 @@ SetVirtualAddressMapEvent(
         SerialPrintSafe("SingularityDxe:   oSetVariable converted -> 0x%lx (status 0x%lx)\r\n",
                   (UINT64)(UINTN)oSetVariable, (UINT64)s);
     }
-    // ДОСКОНАЛИЙ ФІКС: Конвертуємо адресу нашого Get-хука під віртуальний простір Windows
     if (oGetVariable != NULL) {
         EFI_STATUS s = gRT->ConvertPointer(0, (VOID**)&oGetVariable);
         SerialPrintSafe("SingularityDxe:   oGetVariable converted -> 0x%lx (status 0x%lx)\r\n",
@@ -320,6 +320,7 @@ DxeDriverEntry(
     EFI_LOADED_IMAGE    *LoadedImage      = NULL;
     VOID                *Buf              = NULL;
     INT32               OriginalAttribute = 0;
+    // ФІКС: Відновлено повноцінний оригінальний масив для безпечного логування
     CHAR8               AsciiBuffer[256];
 
     OriginalAttribute = SetConsoleTextColour(EFI_GREEN, TRUE);
@@ -374,6 +375,7 @@ DxeDriverEntry(
         SingularityDebugPrint(AsciiBuffer);
         return Status;
     }
+
     SingularityDebugPrint("SingularityDxe:   step 4/7 driver protocol installed\r\n");
     LoadedImage->Unload = DxeDriverUnload;
     Status = gBS->AllocatePool(EfiRuntimeServicesCode, DRIVER_SIZE, &Buf);
@@ -389,7 +391,6 @@ DxeDriverEntry(
                     "SingularityDxe: DriverBuffer @ 0x%llx\r\n", (UINT64)DriverBuffer);
         SingularityDebugPrint(AsciiBuffer);
     }
-    // РІДНИЙ ХУК НА SETVARIABLE
     oSetVariable = (EFI_SET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT,
                                                         (VOID**)&gRT->SetVariable,
                                                         (VOID*)HookedSetVariable);
@@ -401,7 +402,8 @@ DxeDriverEntry(
                 "SingularityDxe:   step 5/7 SetVariable hooked (original @ 0x%llx, hook @ 0x%llx)\r\n",
                 (UINT64)(UINTN)oSetVariable, (UINT64)(UINTN)HookedSetVariable);
     SingularityDebugPrint(AsciiBuffer);
-    // ДОСКОНАЛИЙ ФІКС: ВСТАНОВЛЮЄМО НАШ НОВИЙ ПАРАЛЕЛЬНИЙ АПАРАТНИЙ ХУК НА GETVARIABLE!
+
+    // ФІКС: Встановлюємо наш новий паралельний апаратний хук на GetVariable
     oGetVariable = (EFI_GET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT,
                                                         (VOID**)&gRT->GetVariable,
                                                         (VOID*)HookedGetVariable);
@@ -413,6 +415,7 @@ DxeDriverEntry(
                 "SingularityDxe:   [NEW FIX] GetVariable hooked (original @ 0x%llx, hook @ 0x%llx)\r\n",
                 (UINT64)(UINTN)oGetVariable, (UINT64)(UINTN)HookedGetVariable);
     SingularityDebugPrint(AsciiBuffer);
+
     Status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY,
                                 SetVirtualAddressMapEvent, NULL,
                                 &gEfiEventVirtualAddressChangeGuid, &NotifyEvent);
@@ -423,6 +426,7 @@ DxeDriverEntry(
         return Status;
     }
     SingularityDebugPrint("SingularityDxe:   step 6/7 VirtualAddressChange event registered\r\n");
+
     Status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY,
                                 ExitBootServicesEvent, NULL,
                                 &gEfiEventExitBootServicesGuid, &ExitEvent);
