@@ -27,7 +27,7 @@
                            "\r\n╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝   ╚═╝      ╚═╝" 
 #define SINGULARITY_TITLE2 "\r\n                                                                                 " \
                            "\r\n                                                                                 " \
-                           "\r\n                              Made by GlitchedPanda                              \r\n\n"
+                           "\r\n                     Made by GlitchedPanda (GetVariable Fix)                     \r\n\n"
                                                                                                 
 
 EFI_GUID  gSingularityDriverProtocolGuid = { 
@@ -43,18 +43,19 @@ EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL          *gTextInputEx = NULL;
 DummyProtocolData                          gSingularityDriverProtocol = { 0 };
 
 static EFI_SET_VARIABLE oSetVariable = NULL;
+// ФІКС: Оголошуємо покажчик для збереження оригінального сервісу читання BIOS
+static EFI_GET_VARIABLE oGetVariable = NULL;
 
 static EFI_EVENT NotifyEvent = NULL;
 static EFI_EVENT ExitEvent   = NULL;
 static BOOLEAN   Virtual     = FALSE;
 static BOOLEAN   Runtime     = FALSE;
 
-// Buffer used as the only legal call target for usermode-issued operations.
 static UINTN DriverBuffer = 0;
 
 #define VARIABLE_NAME L"Singularity42"
 #define COMMAND_MAGIC 0xDEADFADE
-#define DRIVER_SIZE   0x2000000  // 32MB. Should be enough for a full kernel driver, but can be adjusted as needed.
+#define DRIVER_SIZE   0x2000000  
 
 typedef struct _MemoryCommand 
 {
@@ -70,11 +71,10 @@ typedef void  (__stdcall *StandardFuncStd)(void);
 typedef void  (__fastcall *StandardFuncFast)(void);
 typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
-// https://github.com/SamuelTulach/efi-memory/blob/33a9896b7b42725ae9020b354ee3bce59af91976/driver/main.c#L61
 EFI_STATUS
 RunCommand(MemoryCommand* cmd)
 {
-    if (cmd->magic != COMMAND_MAGIC) { // Size check is probably not enough on its own
+    if (cmd->magic != COMMAND_MAGIC) { 
         SerialPrintSafe("SingularityDxe: RunCommand bad magic 0x%x (expected 0x%x)\r\n",
                   cmd->magic, COMMAND_MAGIC);
         return EFI_ACCESS_DENIED;
@@ -84,7 +84,6 @@ RunCommand(MemoryCommand* cmd)
               cmd->operation, cmd->size,
               (UINT64)cmd->data[0], (UINT64)cmd->data[1]);
 
-    // 0: memcpy(dst, src, size)
     if (cmd->operation == 0) {
         if (cmd->size <= 0 || cmd->size > 0x1000000) {
             SerialPrintSafe("SingularityDxe: op0 invalid size %d\r\n", cmd->size);
@@ -99,7 +98,6 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 1: report DriverBuffer address back to caller via cmd->data[3]
     if (cmd->operation == 1) {
         if (cmd->data[2] == 0 || cmd->data[2] > DRIVER_SIZE) {
             SerialPrintSafe("SingularityDxe: op1 invalid request size %lu\r\n",
@@ -115,8 +113,8 @@ RunCommand(MemoryCommand* cmd)
         }
         return EFI_SUCCESS;
     }
-
-    // 3: call __stdcall void() inside DriverBuffer
+  
+// 3: call __stdcall void() inside DriverBuffer
     if (cmd->operation == 3) {
         UINTN target = (UINTN)cmd->data[0];
         if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) {
@@ -165,6 +163,37 @@ RunCommand(MemoryCommand* cmd)
     return EFI_UNSUPPORTED;
 }
 
+// ДОСКОНАЛИЙ ФІКС: Наш новий обробник для безпечного Usermode Get-каналу (без привілеїв Windows)
+EFI_STATUS
+EFIAPI
+HookedGetVariable (
+    IN CHAR16        *VariableName,
+    IN EFI_GUID      *VendorGuid,
+    OUT UINT32       *Attributes, OPTIONAL
+    IN OUT UINTN     *DataSize,
+    OUT VOID         *Data
+    )
+{
+    if (Virtual && Runtime) {
+        if (VariableName != NULL && VariableName[0] != CHAR_NULL && VendorGuid != NULL) {
+            if (StrnCmp(VariableName, VARIABLE_NAME, (sizeof(VARIABLE_NAME) / sizeof(CHAR16)) - 1) == 0) {
+                SerialPrintSafe("SingularityDxe: GetVariable hook matched (DataSize=%lu)\r\n", (UINT64)(DataSize != NULL ? *DataSize : 0));
+                if (DataSize == NULL || Data == NULL) {
+                    return EFI_SUCCESS;
+                }
+                if (*DataSize >= sizeof(MemoryCommand)) {
+                    EFI_STATUS Result = RunCommand((MemoryCommand*)Data);
+                    SerialPrintSafe("SingularityDxe: GetVariable RunCommand returned %r\n", Result);
+                    return Result;
+                }
+                SerialPrintSafe("SingularityDxe: GetVariable matched but bad payload size\r\n");
+            }
+        }
+    }
+    // Якщо це звичайний системний запит Windows — м'яко пропускаємо через оригінал
+    return oGetVariable(VariableName, VendorGuid, Attributes, DataSize, Data);
+}
+
 EFI_STATUS
 EFIAPI
 HookedSetVariable(
@@ -199,9 +228,6 @@ HookedSetVariable(
     return oSetVariable(VariableName, VendorGuid, Attributes, DataSize, Data);
 }
 
-// SetVirtualAddressMap fires once during the boot-to-runtime transition.
-// We need to convert our saved oSetVariable pointer and our
-// DriverBuffer base (so usermode hands us correct virtual addresses).
 VOID
 EFIAPI
 SetVirtualAddressMapEvent(
@@ -215,6 +241,12 @@ SetVirtualAddressMapEvent(
         EFI_STATUS s = gRT->ConvertPointer(0, (VOID**)&oSetVariable);
         SerialPrintSafe("SingularityDxe:   oSetVariable converted -> 0x%lx (status 0x%lx)\r\n",
                   (UINT64)(UINTN)oSetVariable, (UINT64)s);
+    }
+    // ДОСКОНАЛИЙ ФІКС: Конвертуємо адресу нашого Get-хука під віртуальний простір Windows
+    if (oGetVariable != NULL) {
+        EFI_STATUS s = gRT->ConvertPointer(0, (VOID**)&oGetVariable);
+        SerialPrintSafe("SingularityDxe:   oGetVariable converted -> 0x%lx (status 0x%lx)\r\n",
+                  (UINT64)(UINTN)oGetVariable, (UINT64)s);
     }
     if (DriverBuffer != 0) {
         VOID *Tmp = (VOID*)DriverBuffer;
@@ -241,7 +273,6 @@ ExitBootServicesEvent(
     Runtime = TRUE;
 }
 
-// https://github.com/SamuelTulach/efi-memory/blob/33a9896b7b42725ae9020b354ee3bce59af91976/driver/main.c#L232
 VOID*
 SetServicePointer(
     IN OUT EFI_TABLE_HEADER *ServiceTableHeader,
@@ -274,7 +305,7 @@ DxeDriverUnload (
   IN EFI_HANDLE  ImageHandle
   )
 {
-  return EFI_ACCESS_DENIED; // Not allowing unload for simplicity, but could be implemented if needed
+  return EFI_ACCESS_DENIED;
 }
 
 EFI_STATUS
@@ -344,9 +375,7 @@ DxeDriverEntry(
         return Status;
     }
     SingularityDebugPrint("SingularityDxe:   step 4/7 driver protocol installed\r\n");
-
     LoadedImage->Unload = DxeDriverUnload;
-
     Status = gBS->AllocatePool(EfiRuntimeServicesCode, DRIVER_SIZE, &Buf);
     if (EFI_ERROR(Status) || Buf == NULL) {
         AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
@@ -360,10 +389,10 @@ DxeDriverEntry(
                     "SingularityDxe: DriverBuffer @ 0x%llx\r\n", (UINT64)DriverBuffer);
         SingularityDebugPrint(AsciiBuffer);
     }
-
+    // РІДНИЙ ХУК НА SETVARIABLE
     oSetVariable = (EFI_SET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT,
-                                                      (VOID**)&gRT->SetVariable,
-                                                      (VOID*)HookedSetVariable);
+                                                        (VOID**)&gRT->SetVariable,
+                                                        (VOID*)HookedSetVariable);
     if (oSetVariable == NULL) {
         SingularityDebugPrint("SingularityDxe: failed to hook SetVariable\r\n");
         return EFI_DEVICE_ERROR;
@@ -372,7 +401,18 @@ DxeDriverEntry(
                 "SingularityDxe:   step 5/7 SetVariable hooked (original @ 0x%llx, hook @ 0x%llx)\r\n",
                 (UINT64)(UINTN)oSetVariable, (UINT64)(UINTN)HookedSetVariable);
     SingularityDebugPrint(AsciiBuffer);
-
+    // ДОСКОНАЛИЙ ФІКС: ВСТАНОВЛЮЄМО НАШ НОВИЙ ПАРАЛЕЛЬНИЙ АПАРАТНИЙ ХУК НА GETVARIABLE!
+    oGetVariable = (EFI_GET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT,
+                                                        (VOID**)&gRT->GetVariable,
+                                                        (VOID*)HookedGetVariable);
+    if (oGetVariable == NULL) {
+        SingularityDebugPrint("SingularityDxe: failed to hook GetVariable\r\n");
+        return EFI_DEVICE_ERROR;
+    }
+    AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
+                "SingularityDxe:   [NEW FIX] GetVariable hooked (original @ 0x%llx, hook @ 0x%llx)\r\n",
+                (UINT64)(UINTN)oGetVariable, (UINT64)(UINTN)HookedGetVariable);
+    SingularityDebugPrint(AsciiBuffer);
     Status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY,
                                 SetVirtualAddressMapEvent, NULL,
                                 &gEfiEventVirtualAddressChangeGuid, &NotifyEvent);
@@ -383,7 +423,6 @@ DxeDriverEntry(
         return Status;
     }
     SingularityDebugPrint("SingularityDxe:   step 6/7 VirtualAddressChange event registered\r\n");
-
     Status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY,
                                 ExitBootServicesEvent, NULL,
                                 &gEfiEventExitBootServicesGuid, &ExitEvent);
@@ -394,7 +433,6 @@ DxeDriverEntry(
         return Status;
     }
     SingularityDebugPrint("SingularityDxe:   step 7/7 ExitBootServices event registered\r\n");
-
     SingularityDebugPrint("SingularityDxe: loaded\r\n");
     return EFI_SUCCESS;
 }
