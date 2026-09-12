@@ -24,36 +24,29 @@
                            "\r\n╚════██║██║██║╚██╗██║██║   ██║██║   ██║██║     ██╔══██║██╔══██╗██║   ██║     ╚██╔╝" \
                            "\r\n███████║██║██║ ╚████║╚██████╔╝╚██████╔╝███████╗██║  ██║██║  ██║██║   ██║      ██║" \
                            "\r\n╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝   ╚═╝      ╚═╝"
-
 #define SINGULARITY_TITLE2 "\r\n                                                                                 " \
                            "\r\n                                                                                 " \
-                           "\r\n                     Made by GlitchedPanda (UEFI pure reader)                     \r\n\n"
+                           "\r\n                              Made by GlitchedPanda                              \r\n\n"
 
-// ============================================================
-//  GUIDs
-// ============================================================
-EFI_GUID gSingularityDriverProtocolGuid = {
+EFI_GUID  gSingularityDriverProtocolGuid = {
   0xdeadfade, 0x0601, 0x47C6, { 0x84, 0xE7, 0x2E, 0xBC, 0x93, 0x7D, 0x1B, 0x11 }
 };
 
-EFI_GUID gSingularityVersionProtocolGuid = {
+EFI_GUID  gEfiDriverSupportedEfiVersionProtocolGuid = {
   0xdeadfade, 0xDB2B, 0x42D2, { 0xBF, 0x5F, 0xBA, 0xF9, 0xC5, 0x51, 0x71, 0x54 }
 };
 
-EFI_DRIVER_SUPPORTED_EFI_VERSION_PROTOCOL gSingularitySupportedEfiVersion = { 0x00020000 };
-EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *gTextInputEx = NULL;
-DummyProtocolData gSingularityDriverProtocol = { 0 };
+EFI_DRIVER_SUPPORTED_EFI_VERSION_PROTOCOL  gSingularitySupportedEfiVersion = { 0 };
+EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL          *gTextInputEx = NULL;
+DummyProtocolData                          gSingularityDriverProtocol = { 0 };
 
-// ============================================================
-//  Globals
-// ============================================================
 static EFI_SET_VARIABLE oSetVariable = NULL;
 static EFI_GET_VARIABLE oGetVariable = NULL;
 
 static EFI_EVENT NotifyEvent = NULL;
 static EFI_EVENT ExitEvent   = NULL;
-static volatile BOOLEAN Virtual = FALSE;
-static volatile BOOLEAN Runtime = FALSE;
+static BOOLEAN   Virtual     = FALSE;
+static BOOLEAN   Runtime     = FALSE;
 
 static UINTN DriverBuffer = 0;
 
@@ -61,67 +54,39 @@ static UINTN DriverBuffer = 0;
 #define COMMAND_MAGIC 0xDEADFADE
 #define DRIVER_SIZE   0x2000000
 
-#define OP_INIT       1
-#define OP_WRITE_TEST 2
-#define OP_READ_TEST  3
-#define OP_CLEAR_TEST 4
+// === Mode 4 extensions ===
 #define OP_FIND_PROC  0x10
+#define OP_READ_CR3   0x11
 
 #define WINDOWS_DIRECT_MAP_BASE 0xFFFF800000000000ULL
 #define CR4_SMEP (1ULL << 20)
 #define CR4_SMAP (1ULL << 21)
 
-// ============================================================
-//  EPROCESS layouts
-// ============================================================
-typedef struct {
-    UINT32 PidOff;
-    UINT32 DtbOff;
-    UINT32 NameOff;
-} EPROCESS_LAYOUT;
-
-STATIC CONST EPROCESS_LAYOUT KnownLayouts[] = {
-    { 0x440, 0x28, 0x5a8 },   // Win10 2004-22H2 (19041-19045)
-    { 0x440, 0x28, 0x5a8 },   // Win10 20H2-21H2 (дубль)
-    { 0x2e0, 0x28, 0x450 },   // Win10 1809 (17763)
-    { 0x2e8, 0x28, 0x450 },   // Win10 1903/1909 (18362/18363)
-    { 0x4b8, 0x28, 0x620 },   // Win11 22H2 (22621)
-};
-#define NUM_LAYOUTS (sizeof(KnownLayouts)/sizeof(KnownLayouts[0]))
-
-typedef struct _MemoryCommand {
+typedef struct _MemoryCommand
+{
     int magic;
     int operation;
     unsigned long long data[10];
     int size;
 } MemoryCommand;
 
-static UINT64 CachedCr3 = 0;
-static UINT32 CachedPid = 0;
+typedef UINTN (__stdcall *ExAllocatePool)(int type, UINTN size);
+typedef void  (__stdcall *ExFreePool)(UINTN address);
+typedef void  (__stdcall *StandardFuncStd)(void);
+typedef void  (__fastcall *StandardFuncFast)(void);
+typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
-// RAM ranges
+// ============================================================
+//  Mode 4 helpers
+// ============================================================
 #define MAX_RAM_RANGES 64
 typedef struct { UINT64 Start; UINT64 End; } RAM_RANGE;
 static RAM_RANGE RamRanges[MAX_RAM_RANGES];
 static UINTN     RamRangeCount = 0;
 
-// ============================================================
-//  SMAP / SMEP (з правильною SaveAndDisableInterrupts)
-// ============================================================
-STATIC VOID SmepSmapOff(OUT UINTN *Saved, OUT BOOLEAN *IfSaved) {
-    *IfSaved = SaveAndDisableInterrupts();
-    *Saved   = AsmReadCr4();
-    AsmWriteCr4(*Saved & ~(CR4_SMEP | CR4_SMAP));
-}
+static UINT64 CachedCr3 = 0;
+static UINT32 CachedPid = 0;
 
-STATIC VOID SmepSmapOn(IN UINTN Saved, IN BOOLEAN IfSaved) {
-    AsmWriteCr4(Saved);
-    if (IfSaved) EnableInterrupts();
-}
-
-// ============================================================
-//  Physical memory + VA→PA
-// ============================================================
 STATIC UINT64 ReadPhysicalU64(IN UINT64 Pa) {
     return *(volatile UINT64 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Pa);
 }
@@ -152,82 +117,154 @@ STATIC UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     return (e1 & 0x000FFFFFFFFFF000ULL) + off;
 }
 
-// ============================================================
-//  Сканування EPROCESS
-// ============================================================
 STATIC UINT64 ScanForProcessCr3(IN UINT32 TargetPid) {
-    if (RamRangeCount == 0) {
-        SerialPrintSafe("SingularityDxe: no RAM ranges, abort\r\n");
-        return 0;
-    }
+    if (RamRangeCount == 0) return 0;
 
-    SerialPrintSafe("SingularityDxe: scanning for PID %d across %d ranges...\r\n",
-                    TargetPid, (UINT32)RamRangeCount);
+    CONST UINT64 Pattern = 0x006578652E327363ULL;  // "cs2.exe\0"
 
-    for (UINTN L = 0; L < NUM_LAYOUTS; L++) {
-        UINT32 PidOff  = KnownLayouts[L].PidOff;
-        UINT32 DtbOff  = KnownLayouts[L].DtbOff;
-        UINT32 NameOff = KnownLayouts[L].NameOff;
+    for (UINTN r = 0; r < RamRangeCount; r++) {
+        UINT64 Start = RamRanges[r].Start;
+        UINT64 End   = RamRanges[r].End;
+        if (Start < 0x100000) Start = 0x100000;
+        if (End > 0x800000000ULL) End = 0x800000000ULL;
+        Start &= ~7ULL;
+        End   &= ~7ULL;
 
-        for (UINTN r = 0; r < RamRangeCount; r++) {
-            UINT64 Start = RamRanges[r].Start;
-            UINT64 End   = RamRanges[r].End;
-            if (Start < 0x100000) Start = 0x100000;
-            if (End > 0x400000000ULL) End = 0x400000000ULL;
+        for (UINT64 Pa = Start; Pa + 8 <= End; Pa += 8) {
+            UINT64 V = *(volatile UINT64 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Pa);
+            if (V != Pattern) continue;
 
-            for (UINT64 Pa = Start; Pa + 8 < End; Pa += 16) {
-                UINT64 V = *(volatile UINT64 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Pa);
-                if ((UINT32)V != TargetPid) continue;
-                if ((V >> 32) != 0) continue;
+            if (Pa < 0x5a8) continue;
+            UINT64 Ep = Pa - 0x5a8;
+            if (Ep & 0xF) continue;
 
-                if (Pa < PidOff) continue;
-                UINT64 Ep = Pa - PidOff;
-                if (Ep & 0xF) continue;
+            UINT32 Pid = *(volatile UINT32 *)(UINTN)
+                (WINDOWS_DIRECT_MAP_BASE + Ep + 0x440);
+            if (Pid != TargetPid) continue;
 
-                UINT64 Dtb = *(volatile UINT64 *)(UINTN)
-                    (WINDOWS_DIRECT_MAP_BASE + Ep + DtbOff);
-                if (Dtb == 0 || (Dtb & 0xFFF) != 0) continue;
-                if (Dtb > 0x10000000000ULL) continue;
+            UINT64 Dtb = *(volatile UINT64 *)(UINTN)
+                (WINDOWS_DIRECT_MAP_BASE + Ep + 0x28);
+            if (Dtb == 0 || (Dtb & 0xFFF) != 0) continue;
+            if (Dtb > 0x10000000000ULL) continue;
 
-                UINT8 c0 = *(volatile UINT8 *)(UINTN)
-                    (WINDOWS_DIRECT_MAP_BASE + Ep + NameOff);
-                if (c0 < 0x20 || c0 > 0x7E) continue;
-
-                SerialPrintSafe("SingularityDxe: EPROCESS @ PA 0x%lx DTB=0x%lx name='%a' layout=%d\r\n",
-                                Ep, Dtb,
-                                (CHAR8 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Ep + NameOff),
-                                (UINT32)L);
-                return Dtb;
-            }
+            SerialPrintSafe("SingularityDxe: EPROCESS @ PA 0x%lx PID=%d DTB=0x%lx\r\n",
+                            Ep, Pid, Dtb);
+            return Dtb;
         }
     }
-
-    SerialPrintSafe("SingularityDxe: PID %d not found in any layout\r\n", TargetPid);
+    SerialPrintSafe("SingularityDxe: cs2.exe not found\r\n");
     return 0;
 }
 
+STATIC VOID SmepSmapOff(OUT UINTN *Saved) {
+    *Saved = AsmReadCr4();
+    AsmWriteCr4(*Saved & ~(CR4_SMEP | CR4_SMAP));
+}
+
+STATIC VOID SmepSmapOn(IN UINTN Saved) {
+    AsmWriteCr4(Saved);
+}
+
 // ============================================================
-//  RunCommand
+//  RunCommand — ORIHINAL op=0/1/3/4/5 + нові op=0x10/0x11
 // ============================================================
-EFI_STATUS RunCommand(MemoryCommand *cmd) {
+EFI_STATUS
+RunCommand(MemoryCommand* cmd)
+{
     if (cmd->magic != COMMAND_MAGIC) {
-        SerialPrintSafe("SingularityDxe: bad magic 0x%x\r\n", cmd->magic);
+        SerialPrintSafe("SingularityDxe: RunCommand bad magic 0x%x (expected 0x%x)\r\n",
+                  cmd->magic, COMMAND_MAGIC);
         return EFI_ACCESS_DENIED;
     }
 
-    SerialPrintSafe("SingularityDxe: op=0x%x size=%d d0=0x%lx d1=0x%lx\r\n",
-                    cmd->operation, cmd->size, cmd->data[0], cmd->data[1]);
+    SerialPrintSafe("SingularityDxe: RunCommand op=%d size=%d data[0]=0x%lx data[1]=0x%lx\r\n",
+              cmd->operation, cmd->size,
+              (UINT64)cmd->data[0], (UINT64)cmd->data[1]);
 
-    // ---------- OP_FIND_PROC ----------
+    // 0: memcpy(dst, src, size)
+    if (cmd->operation == 0) {
+        if (cmd->size <= 0 || cmd->size > 0x1000000) {
+            SerialPrintSafe("SingularityDxe: op0 invalid size %d\r\n", cmd->size);
+            return EFI_INVALID_PARAMETER;
+        }
+        if (cmd->data[0] == 0 || cmd->data[1] == 0) {
+            SerialPrintSafe("SingularityDxe: op0 null src/dst\r\n");
+            return EFI_INVALID_PARAMETER;
+        }
+        CopyMem((VOID*)(UINTN)cmd->data[0], (VOID*)(UINTN)cmd->data[1], cmd->size);
+        SerialPrintSafe("SingularityDxe: op0 copy ok\r\n");
+        return EFI_SUCCESS;
+    }
+
+    // 1: report DriverBuffer address back to caller via cmd->data[3]
+    if (cmd->operation == 1) {
+        if (cmd->data[2] == 0 || cmd->data[2] > DRIVER_SIZE) {
+            SerialPrintSafe("SingularityDxe: op1 invalid request size %lu\r\n",
+                      (UINT64)cmd->data[2]);
+            return EFI_INVALID_PARAMETER;
+        }
+        if (cmd->data[3] != 0) {
+            *(UINTN*)(UINTN)cmd->data[3] = DriverBuffer;
+            SerialPrintSafe("SingularityDxe: op1 wrote DriverBuffer=0x%lx to 0x%lx\r\n",
+                      (UINT64)DriverBuffer, (UINT64)cmd->data[3]);
+        } else {
+            SerialPrintSafe("SingularityDxe: op1 no output slot provided\r\n");
+        }
+        return EFI_SUCCESS;
+    }
+
+    // 3: call __stdcall void() inside DriverBuffer
+    if (cmd->operation == 3) {
+        UINTN target = (UINTN)cmd->data[0];
+        if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) {
+            SerialPrintSafe("SingularityDxe: op3 target 0x%lx outside DriverBuffer\r\n",
+                      (UINT64)target);
+            return EFI_ACCESS_DENIED;
+        }
+        SerialPrintSafe("SingularityDxe: op3 calling stdcall@0x%lx\r\n", (UINT64)target);
+        ((StandardFuncStd)target)();
+        SerialPrintSafe("SingularityDxe: op3 returned\r\n");
+        return EFI_SUCCESS;
+    }
+
+    // 4: call __fastcall void() inside DriverBuffer
+    if (cmd->operation == 4) {
+        UINTN target = (UINTN)cmd->data[0];
+        if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) {
+            SerialPrintSafe("SingularityDxe: op4 target 0x%lx outside DriverBuffer\r\n",
+                      (UINT64)target);
+            return EFI_ACCESS_DENIED;
+        }
+        SerialPrintSafe("SingularityDxe: op4 calling fastcall@0x%lx\r\n", (UINT64)target);
+        ((StandardFuncFast)target)();
+        SerialPrintSafe("SingularityDxe: op4 returned\r\n");
+        return EFI_SUCCESS;
+    }
+
+    // 5: invoke a Windows-style DriverEntry inside DriverBuffer, return its status
+    if (cmd->operation == 5) {
+        UINTN target = (UINTN)cmd->data[0];
+        if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) {
+            SerialPrintSafe("SingularityDxe: op5 target 0x%lx outside DriverBuffer\r\n",
+                      (UINT64)target);
+            return EFI_ACCESS_DENIED;
+        }
+        SerialPrintSafe("SingularityDxe: op5 calling DriverEntry@0x%lx\r\n", (UINT64)target);
+        unsigned long status = ((DriverEntry)target)(0, 0);
+        SerialPrintSafe("SingularityDxe: op5 returned status=0x%x\r\n", (UINT32)status);
+        if (cmd->data[1] != 0) {
+            *(unsigned long*)(UINTN)cmd->data[1] = status;
+        }
+        return EFI_SUCCESS;
+    }
+
+    // ==== Mode 4 extensions ====
+
+    // 0x10: find process by PID, cache CR3
     if (cmd->operation == OP_FIND_PROC) {
         UINT32 Pid = (UINT32)cmd->data[0];
         if (Pid == 0) return EFI_INVALID_PARAMETER;
-
-        UINTN Saved; BOOLEAN If;
-        SmepSmapOff(&Saved, &If);
         UINT64 Cr3 = ScanForProcessCr3(Pid);
-        SmepSmapOn(Saved, If);
-
         if (Cr3 == 0) return EFI_NOT_FOUND;
         CachedPid = Pid;
         CachedCr3 = Cr3;
@@ -235,18 +272,18 @@ EFI_STATUS RunCommand(MemoryCommand *cmd) {
         return EFI_SUCCESS;
     }
 
-    // ---------- op=0: READ CS2 ----------
-    if (cmd->operation == 0) {
+    // 0x11: read memory via cached CR3 (VA -> PA -> direct map)
+    if (cmd->operation == OP_READ_CR3) {
         if (CachedCr3 == 0) {
-            SerialPrintSafe("SingularityDxe: op0 no CR3 (call op=0x10 first)\r\n");
+            SerialPrintSafe("SingularityDxe: op11 no CR3\r\n");
             return EFI_NOT_READY;
         }
         if (cmd->size <= 0 || cmd->size > 0x100000) {
-            SerialPrintSafe("SingularityDxe: op0 bad size %d\r\n", cmd->size);
+            SerialPrintSafe("SingularityDxe: op11 bad size %d\r\n", cmd->size);
             return EFI_INVALID_PARAMETER;
         }
         if (cmd->data[0] == 0 || cmd->data[1] == 0) {
-            SerialPrintSafe("SingularityDxe: op0 null dst/src\r\n");
+            SerialPrintSafe("SingularityDxe: op11 null ptr\r\n");
             return EFI_INVALID_PARAMETER;
         }
 
@@ -255,166 +292,66 @@ EFI_STATUS RunCommand(MemoryCommand *cmd) {
         UINTN  Size  = (UINTN)cmd->size;
         UINTN  Done  = 0;
 
-        UINTN Saved; BOOLEAN If;
-        SmepSmapOff(&Saved, &If);
+        UINTN Saved;
+        SmepSmapOff(&Saved);
 
         while (Done < Size) {
             UINT64 CurVa = SrcVa + Done;
             UINT64 Pa = VirtualToPhysical(CachedCr3, CurVa);
             if (Pa == 0) {
-                SmepSmapOn(Saved, If);
-                SerialPrintSafe("SingularityDxe: op0 VA 0x%lx -> PA failed\r\n", CurVa);
+                SmepSmapOn(Saved);
+                SerialPrintSafe("SingularityDxe: op11 VA 0x%lx -> PA failed\r\n", CurVa);
                 return EFI_NOT_FOUND;
             }
-
             UINTN PageOff = (UINTN)(CurVa & 0xFFF);
             UINTN ToCopy  = 0x1000 - PageOff;
             if (ToCopy > (Size - Done)) ToCopy = Size - Done;
-
             volatile UINT8 *SrcP = (volatile UINT8 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Pa);
             volatile UINT8 *DstP = (volatile UINT8 *)(UINTN)(DstVa + Done);
             for (UINTN i = 0; i < ToCopy; i++) DstP[i] = SrcP[i];
-
             Done += ToCopy;
         }
-
-        SmepSmapOn(Saved, If);
-        SerialPrintSafe("SingularityDxe: op0 read %d bytes from VA 0x%lx OK\r\n",
+        SmepSmapOn(Saved);
+        SerialPrintSafe("SingularityDxe: op11 read %d bytes from VA 0x%lx OK\r\n",
                         (UINT32)Size, SrcVa);
         return EFI_SUCCESS;
     }
 
-    if (DriverBuffer == 0) return EFI_NOT_READY;
-
-    // ---------- Тестові ----------
-    if (cmd->operation == OP_INIT) {
-        cmd->size = DRIVER_SIZE;
-        return EFI_SUCCESS;
-    }
-    if (cmd->operation == OP_WRITE_TEST) {
-        if (cmd->size <= 0 || cmd->size > (int)sizeof(cmd->data)) return EFI_INVALID_PARAMETER;
-        CopyMem((VOID *)DriverBuffer, (VOID *)&cmd->data[0], cmd->size);
-        return EFI_SUCCESS;
-    }
-    if (cmd->operation == OP_READ_TEST) {
-        if (cmd->size <= 0 || cmd->size > (int)sizeof(cmd->data)) return EFI_INVALID_PARAMETER;
-        CopyMem((VOID *)&cmd->data[0], (VOID *)DriverBuffer, cmd->size);
-        return EFI_SUCCESS;
-    }
-    if (cmd->operation == OP_CLEAR_TEST) {
-        ZeroMem((VOID *)DriverBuffer, DRIVER_SIZE);
-        return EFI_SUCCESS;
-    }
-
-    // ---------- op=1: DriverBuffer address ----------
-    if (cmd->operation == 1) {
-        if (cmd->data[3] != 0) {
-            UINTN Saved; BOOLEAN If;
-            SmepSmapOff(&Saved, &If);
-            *(UINTN *)(UINTN)cmd->data[3] = DriverBuffer;
-            SmepSmapOn(Saved, If);
-        }
-        return EFI_SUCCESS;
-    }
-
-    // ---------- op=5: DriverEntry ----------
-    if (cmd->operation == 5) {
-        UINTN Tgt = (UINTN)cmd->data[0];
-        if (Tgt < DriverBuffer || Tgt >= DriverBuffer + DRIVER_SIZE) return EFI_ACCESS_DENIED;
-        unsigned long St = ((unsigned long (*)(void *, void *))Tgt)(0, 0);
-        if (cmd->data[1] != 0) {
-            UINTN Saved; BOOLEAN If;
-            SmepSmapOff(&Saved, &If);
-            *(unsigned long *)(UINTN)cmd->data[1] = St;
-            SmepSmapOn(Saved, If);
-        }
-        return EFI_SUCCESS;
-    }
-
-    SerialPrintSafe("SingularityDxe: unknown op 0x%x\r\n", cmd->operation);
+    SerialPrintSafe("SingularityDxe: unknown op %d\r\n", cmd->operation);
     return EFI_UNSUPPORTED;
 }
 
 // ============================================================
-//  Variable matching
+//  SetVariable hook — ОРИГІНАЛ (тільки ім'я, без GUID)
 // ============================================================
-STATIC BOOLEAN IsOurVariable(IN CHAR16 *Name, IN EFI_GUID *Guid) {
-    if (Name == NULL || Guid == NULL) return FALSE;
-    if (StrnCmp(Name, VARIABLE_NAME, (sizeof(VARIABLE_NAME)/sizeof(CHAR16))-1) != 0)
-        return FALSE;
-    if (!CompareGuid(Guid, &gSingularityDriverProtocolGuid)) return FALSE;
-    return TRUE;
-}
-
-// ============================================================
-//  Hooks
-// ============================================================
-EFI_STATUS EFIAPI HookedGetVariable(
-    IN CHAR16 *VariableName, IN EFI_GUID *VendorGuid,
-    OUT UINT32 *Attributes OPTIONAL,
-    IN OUT UINTN *DataSize, OUT VOID *Data)
+EFI_STATUS
+EFIAPI
+HookedSetVariable(
+    IN CHAR16    *VariableName,
+    IN EFI_GUID  *VendorGuid,
+    IN UINT32    Attributes,
+    IN UINTN     DataSize,
+    IN VOID      *Data
+    )
 {
     if (Virtual && Runtime) {
-        UINTN Saved; BOOLEAN If;
-        BOOLEAN Match;
-
-        SmepSmapOff(&Saved, &If);
-        Match = IsOurVariable(VariableName, VendorGuid);
-        SmepSmapOn(Saved, If);
-
-        if (Match) {
-            if (Data == NULL || DataSize == NULL) {
-                if (DataSize != NULL) *DataSize = sizeof(MemoryCommand);
-                return EFI_BUFFER_TOO_SMALL;
-            }
-            if (*DataSize >= sizeof(MemoryCommand)) {
-                MemoryCommand Local;
-
-                SmepSmapOff(&Saved, &If);
-                CopyMem(&Local, Data, sizeof(MemoryCommand));
-                SmepSmapOn(Saved, If);
-
-                EFI_STATUS R = RunCommand(&Local);
-
-                SmepSmapOff(&Saved, &If);
-                CopyMem(Data, &Local, sizeof(MemoryCommand));
-                SmepSmapOn(Saved, If);
-
-                return R;
-            }
-        }
-    }
-    return oGetVariable(VariableName, VendorGuid, Attributes, DataSize, Data);
-}
-
-EFI_STATUS EFIAPI HookedSetVariable(
-    IN CHAR16 *VariableName, IN EFI_GUID *VendorGuid,
-    IN UINT32 Attributes, IN UINTN DataSize, IN VOID *Data)
-{
-    if (Virtual && Runtime) {
-        UINTN Saved; BOOLEAN If;
-        BOOLEAN Match;
-
-        SmepSmapOff(&Saved, &If);
-        Match = IsOurVariable(VariableName, VendorGuid);
-        SmepSmapOn(Saved, If);
-
-        if (Match) {
-            if (DataSize == 0 && Data == NULL) return EFI_SUCCESS;
-            if (DataSize == sizeof(MemoryCommand) && Data != NULL) {
-                MemoryCommand Local;
-
-                SmepSmapOff(&Saved, &If);
-                CopyMem(&Local, Data, sizeof(MemoryCommand));
-                SmepSmapOn(Saved, If);
-
-                EFI_STATUS R = RunCommand(&Local);
-
-                SmepSmapOff(&Saved, &If);
-                CopyMem(Data, &Local, sizeof(MemoryCommand));
-                SmepSmapOn(Saved, If);
-
-                return R;
+        if (VariableName != NULL && VariableName[0] != CHAR_NULL && VendorGuid != NULL) {
+            if (StrnCmp(VariableName, VARIABLE_NAME,
+                        (sizeof(VARIABLE_NAME) / sizeof(CHAR16)) - 1) == 0) {
+                SerialPrintSafe("SingularityDxe: hook matched (DataSize=%lu)\r\n",
+                          (UINT64)DataSize);
+                if (DataSize == 0 && Data == NULL) {
+                    SerialPrintSafe("SingularityDxe: empty payload, ack\r\n");
+                    return EFI_SUCCESS;
+                }
+                if (DataSize == sizeof(MemoryCommand) && Data != NULL) {
+                    EFI_STATUS Result = RunCommand((MemoryCommand*)Data);
+                    SerialPrintSafe("SingularityDxe: RunCommand returned %r (0x%lx)\r\n",
+                              Result, (UINT64)Result);
+                    return Result;
+                }
+                SerialPrintSafe("SingularityDxe: hook matched but bad payload (DataSize=%lu, expected=%lu)\r\n",
+                          (UINT64)DataSize, (UINT64)sizeof(MemoryCommand));
             }
         }
     }
@@ -422,96 +359,200 @@ EFI_STATUS EFIAPI HookedSetVariable(
 }
 
 // ============================================================
-//  Events
+//  GetVariable hook — новий, для mode 4
+//  Той самий принцип: тільки ім'я, без GUID.
 // ============================================================
-VOID EFIAPI SetVirtualAddressMapEvent(IN EFI_EVENT Event, IN VOID *Context) {
-    SerialPrint("SingularityDxe: VirtualAddressChange\r\n");
-    if (oSetVariable) gRT->ConvertPointer(0, (VOID **)&oSetVariable);
-    if (oGetVariable) gRT->ConvertPointer(0, (VOID **)&oGetVariable);
-    if (DriverBuffer) {
-        VOID *T = (VOID *)DriverBuffer;
-        gRT->ConvertPointer(0, &T);
-        DriverBuffer = (UINTN)T;
-        SerialPrintSafe("SingularityDxe: DriverBuffer -> 0x%lx\r\n", (UINT64)DriverBuffer);
+EFI_STATUS
+EFIAPI
+HookedGetVariable(
+    IN CHAR16    *VariableName,
+    IN EFI_GUID  *VendorGuid,
+    OUT UINT32   *Attributes, OPTIONAL
+    IN OUT UINTN *DataSize,
+    OUT VOID     *Data
+    )
+{
+    if (Virtual && Runtime) {
+        if (VariableName != NULL && VariableName[0] != CHAR_NULL && VendorGuid != NULL) {
+            if (StrnCmp(VariableName, VARIABLE_NAME,
+                        (sizeof(VARIABLE_NAME) / sizeof(CHAR16)) - 1) == 0) {
+
+                if (Data == NULL || DataSize == NULL) {
+                    if (DataSize != NULL) *DataSize = sizeof(MemoryCommand);
+                    return EFI_BUFFER_TOO_SMALL;
+                }
+                if (*DataSize >= sizeof(MemoryCommand)) {
+                    EFI_STATUS Result = RunCommand((MemoryCommand*)Data);
+                    return Result;
+                }
+            }
+        }
     }
-    NotifyEvent = NULL;
-    Virtual = TRUE;
+    return oGetVariable(VariableName, VendorGuid, Attributes, DataSize, Data);
 }
 
-VOID EFIAPI ExitBootServicesEvent(IN EFI_EVENT Event, IN VOID *Context) {
-    SerialPrint("SingularityDxe: ExitBootServices\r\n");
+// ============================================================
+//  Events (оригінал + ConvertPointer для oGetVariable)
+// ============================================================
+VOID
+EFIAPI
+SetVirtualAddressMapEvent(
+    IN EFI_EVENT Event,
+    IN VOID*     Context
+    )
+{
+    SerialPrint("SingularityDxe: VirtualAddressChange event fired\r\n");
+
+    if (oSetVariable != NULL) {
+        gRT->ConvertPointer(0, (VOID**)&oSetVariable);
+    }
+    if (oGetVariable != NULL) {
+        gRT->ConvertPointer(0, (VOID**)&oGetVariable);
+    }
+    if (DriverBuffer != 0) {
+        VOID *Tmp = (VOID*)DriverBuffer;
+        gRT->ConvertPointer(0, &Tmp);
+        DriverBuffer = (UINTN)Tmp;
+        SerialPrintSafe("SingularityDxe: DriverBuffer converted -> 0x%lx\r\n",
+                  (UINT64)DriverBuffer);
+    }
+
+    NotifyEvent = NULL;
+    Virtual = TRUE;
+    SerialPrint("SingularityDxe: now in virtual address space\r\n");
+}
+
+VOID
+EFIAPI
+ExitBootServicesEvent(
+    IN EFI_EVENT Event,
+    IN VOID*     Context
+    )
+{
+    SerialPrint("SingularityDxe: ExitBootServices event fired, OS taking over\r\n");
     ExitEvent = NULL;
     Runtime = TRUE;
 }
 
-VOID* SetServicePointer(EFI_TABLE_HEADER *H, VOID **Fn, VOID *New) {
-    if (!Fn || !New || !*Fn) return NULL;
-    EFI_TPL Tpl = gBS->RaiseTPL(TPL_HIGH_LEVEL);
-    VOID *Orig = *Fn;
-    *Fn = New;
-    H->CRC32 = 0;
-    gBS->CalculateCrc32((UINT8 *)H, H->HeaderSize, &H->CRC32);
+VOID*
+SetServicePointer(
+    IN OUT EFI_TABLE_HEADER *ServiceTableHeader,
+    IN OUT VOID **ServiceTableFunction,
+    IN VOID *NewFunction
+    )
+{
+    if (ServiceTableFunction == NULL || NewFunction == NULL || *ServiceTableFunction == NULL) {
+        return NULL;
+    }
+    ASSERT(gBS != NULL);
+    ASSERT(gBS->CalculateCrc32 != NULL);
+    CONST EFI_TPL Tpl = gBS->RaiseTPL(TPL_HIGH_LEVEL);
+    VOID* OriginalFunction = *ServiceTableFunction;
+    *ServiceTableFunction = NewFunction;
+    ServiceTableHeader->CRC32 = 0;
+    gBS->CalculateCrc32((UINT8*)ServiceTableHeader, ServiceTableHeader->HeaderSize, &ServiceTableHeader->CRC32);
     gBS->RestoreTPL(Tpl);
-    return Orig;
+    return OriginalFunction;
 }
 
-EFI_STATUS EFIAPI DxeDriverUnload(IN EFI_HANDLE ImageHandle) { return EFI_ACCESS_DENIED; }
+EFI_STATUS
+EFIAPI
+DxeDriverUnload (
+  IN EFI_HANDLE  ImageHandle
+  )
+{
+  return EFI_ACCESS_DENIED;
+}
 
 // ============================================================
-//  Entry Point
+//  Entry Point — оригінал + RAM ranges capture
 // ============================================================
-EFI_STATUS EFIAPI DxeDriverEntry(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *ST) {
-    EFI_STATUS Status;
-    DummyProtocolData *Existing = NULL;
-    EFI_LOADED_IMAGE *LoadedImage = NULL;
-    VOID *Buf = NULL;
-    INT32 OrigAttr;
-    CHAR8 Ascii[256];
+EFI_STATUS
+EFIAPI
+DxeDriverEntry(
+    IN EFI_HANDLE        ImageHandle,
+    IN EFI_SYSTEM_TABLE  *SystemTable
+    )
+{
+    EFI_STATUS          Status;
+    DummyProtocolData   *ExistingProtocol = NULL;
+    EFI_LOADED_IMAGE    *LoadedImage      = NULL;
+    VOID                *Buf              = NULL;
+    INT32               OriginalAttribute = 0;
+    CHAR8               AsciiBuffer[256];
 
-    OrigAttr = SetConsoleTextColour(EFI_GREEN, TRUE);
+    OriginalAttribute = SetConsoleTextColour(EFI_GREEN, TRUE);
     SingularityDebugPrint("\r\n\r\n");
     SingularityPrintBanner(SINGULARITY_TITLE1);
     SingularityDebugPrint(SINGULARITY_TITLE2);
-    gST->ConOut->SetAttribute(gST->ConOut, OrigAttr);
+    gST->ConOut->SetAttribute(gST->ConOut, OriginalAttribute);
+
+    SingularityDebugPrint("SingularityDxe: DxeDriverEntry begin\r\n");
 
     Status = gBS->OpenProtocol(ImageHandle, &gEfiLoadedImageProtocolGuid,
-                               (VOID **)&LoadedImage, ImageHandle, NULL,
-                               EFI_OPEN_PROTOCOL_GET_PROTOCOL);
-    if (EFI_ERROR(Status)) return Status;
+                               (VOID**)&LoadedImage, ImageHandle,
+                               NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+    if (EFI_ERROR(Status)) {
+        AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
+                    "SingularityDxe: OpenProtocol(LoadedImage) failed (%r)\r\n", Status);
+        SingularityDebugPrint(AsciiBuffer);
+        return Status;
+    }
+    SingularityDebugPrint("SingularityDxe:   step 1/7 LoadedImage opened\r\n");
 
-    Status = gBS->LocateProtocol(&gSingularityDriverProtocolGuid, NULL, (VOID **)&Existing);
-    if (Status != EFI_NOT_FOUND) return EFI_ALREADY_STARTED;
+    Status = gBS->LocateProtocol(&gSingularityDriverProtocolGuid, NULL, (VOID**)&ExistingProtocol);
+    if (Status != EFI_NOT_FOUND) {
+        SingularityDebugPrint("SingularityDxe: already loaded\r\n");
+        return EFI_ALREADY_STARTED;
+    }
+    SingularityDebugPrint("SingularityDxe:   step 2/7 no prior instance found\r\n");
 
     Status = gBS->InstallMultipleProtocolInterfaces(&ImageHandle,
-        &gSingularityVersionProtocolGuid, &gSingularitySupportedEfiVersion, NULL);
-    if (EFI_ERROR(Status)) return Status;
+                                                   &gEfiDriverSupportedEfiVersionProtocolGuid,
+                                                   &gSingularitySupportedEfiVersion,
+                                                   NULL);
+    if (EFI_ERROR(Status)) {
+        AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
+                    "SingularityDxe: install supported-version protocol failed (%r)\r\n", Status);
+        SingularityDebugPrint(AsciiBuffer);
+        return Status;
+    }
+    SingularityDebugPrint("SingularityDxe:   step 3/7 supported-version protocol installed\r\n");
 
-    gBS->HandleProtocol(gST->ConsoleInHandle, &gEfiSimpleTextInputExProtocolGuid,
-                        (VOID **)&gTextInputEx);
+    gBS->HandleProtocol(gST->ConsoleInHandle,
+                        &gEfiSimpleTextInputExProtocolGuid,
+                        (VOID**)&gTextInputEx);
 
-    Status = gBS->InstallProtocolInterface(&ImageHandle, &gSingularityDriverProtocolGuid,
-                                           EFI_NATIVE_INTERFACE, &gSingularityDriverProtocol);
-    if (EFI_ERROR(Status)) return Status;
+    Status = gBS->InstallProtocolInterface(&ImageHandle,
+                                           &gSingularityDriverProtocolGuid,
+                                           EFI_NATIVE_INTERFACE,
+                                           &gSingularityDriverProtocol);
+    if (EFI_ERROR(Status)) {
+        AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
+                    "SingularityDxe: install driver protocol failed (%r)\r\n", Status);
+        SingularityDebugPrint(AsciiBuffer);
+        return Status;
+    }
+    SingularityDebugPrint("SingularityDxe:   step 4/7 driver protocol installed\r\n");
 
     LoadedImage->Unload = DxeDriverUnload;
 
-    // ---------- Capture RAM ranges ДО ExitBootServices ----------
+    // ---- Capture RAM ranges ДО ExitBootServices (для mode 4) ----
     {
         UINTN  MapSize = 0, MapKey = 0, DescSize = 0;
         UINT32 DescVer = 0;
-
         gBS->GetMemoryMap(&MapSize, NULL, &MapKey, &DescSize, &DescVer);
         MapSize += 4 * DescSize;
 
         EFI_MEMORY_DESCRIPTOR *Map = NULL;
-        Status = gBS->AllocatePool(EfiBootServicesData, MapSize, (VOID **)&Map);
+        Status = gBS->AllocatePool(EfiBootServicesData, MapSize, (VOID**)&Map);
         if (!EFI_ERROR(Status) && Map != NULL) {
             Status = gBS->GetMemoryMap(&MapSize, Map, &MapKey, &DescSize, &DescVer);
             if (!EFI_ERROR(Status)) {
                 UINTN Count = MapSize / DescSize;
                 for (UINTN i = 0; i < Count && RamRangeCount < MAX_RAM_RANGES; i++) {
                     EFI_MEMORY_DESCRIPTOR *D =
-                        (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + i * DescSize);
+                        (EFI_MEMORY_DESCRIPTOR*)((UINT8*)Map + i * DescSize);
                     if (D->Type == EfiConventionalMemory && D->NumberOfPages >= 0x100) {
                         RamRanges[RamRangeCount].Start = D->PhysicalStart;
                         RamRanges[RamRangeCount].End =
@@ -522,52 +563,70 @@ EFI_STATUS EFIAPI DxeDriverEntry(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE 
             }
             gBS->FreePool(Map);
         }
-        AsciiSPrint(Ascii, sizeof(Ascii),
+        AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
                     "SingularityDxe: %d RAM ranges cached\r\n", (UINT32)RamRangeCount);
-        SingularityDebugPrint(Ascii);
+        SingularityDebugPrint(AsciiBuffer);
     }
 
-    // ---------- DriverBuffer ----------
     Status = gBS->AllocatePool(EfiRuntimeServicesCode, DRIVER_SIZE, &Buf);
-    if (!EFI_ERROR(Status) && Buf != NULL) {
+    if (EFI_ERROR(Status) || Buf == NULL) {
+        AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
+                    "SingularityDxe: AllocatePool failed (%r)\r\n", Status);
+        SingularityDebugPrint(AsciiBuffer);
+        DriverBuffer = 0;
+    } else {
         ZeroMem(Buf, DRIVER_SIZE);
         DriverBuffer = (UINTN)Buf;
-        AsciiSPrint(Ascii, sizeof(Ascii),
+        AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
                     "SingularityDxe: DriverBuffer @ 0x%llx\r\n", (UINT64)DriverBuffer);
-        SingularityDebugPrint(Ascii);
-    } else {
-        DriverBuffer = 0;
-        SingularityDebugPrint("SingularityDxe: DriverBuffer NOT allocated\r\n");
+        SingularityDebugPrint(AsciiBuffer);
     }
 
-    // ---------- Hooks ----------
-    oSetVariable = (EFI_SET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER *)gRT,
-                                                       (VOID **)&gRT->SetVariable,
-                                                       (VOID *)HookedSetVariable);
-    if (!oSetVariable) return EFI_DEVICE_ERROR;
-
-    oGetVariable = (EFI_GET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER *)gRT,
-                                                       (VOID **)&gRT->GetVariable,
-                                                       (VOID *)HookedGetVariable);
-    if (!oGetVariable) {
-        SetServicePointer((EFI_TABLE_HEADER *)gRT,
-                          (VOID **)&gRT->SetVariable, (VOID *)oSetVariable);
+    oSetVariable = (EFI_SET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT,
+                                                      (VOID**)&gRT->SetVariable,
+                                                      (VOID*)HookedSetVariable);
+    if (oSetVariable == NULL) {
+        SingularityDebugPrint("SingularityDxe: failed to hook SetVariable\r\n");
         return EFI_DEVICE_ERROR;
     }
+    AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
+                "SingularityDxe:   step 5/7 SetVariable hooked (original @ 0x%llx, hook @ 0x%llx)\r\n",
+                (UINT64)(UINTN)oSetVariable, (UINT64)(UINTN)HookedSetVariable);
+    SingularityDebugPrint(AsciiBuffer);
+
+    oGetVariable = (EFI_GET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT,
+                                                      (VOID**)&gRT->GetVariable,
+                                                      (VOID*)HookedGetVariable);
+    if (oGetVariable == NULL) {
+        SetServicePointer((EFI_TABLE_HEADER*)gRT, (VOID**)&gRT->SetVariable, (VOID*)oSetVariable);
+        SingularityDebugPrint("SingularityDxe: failed to hook GetVariable\r\n");
+        return EFI_DEVICE_ERROR;
+    }
+    SingularityDebugPrint("SingularityDxe:   step 5b GetVariable hooked\r\n");
 
     Status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY,
                                 SetVirtualAddressMapEvent, NULL,
                                 &gEfiEventVirtualAddressChangeGuid, &NotifyEvent);
     if (EFI_ERROR(Status)) {
-        SetServicePointer((EFI_TABLE_HEADER *)gRT, (VOID **)&gRT->GetVariable, (VOID *)oGetVariable);
-        SetServicePointer((EFI_TABLE_HEADER *)gRT, (VOID **)&gRT->SetVariable, (VOID *)oSetVariable);
+        SetServicePointer((EFI_TABLE_HEADER*)gRT, (VOID**)&gRT->GetVariable, (VOID*)oGetVariable);
+        SetServicePointer((EFI_TABLE_HEADER*)gRT, (VOID**)&gRT->SetVariable, (VOID*)oSetVariable);
+        AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
+                    "SingularityDxe: CreateEventEx(VirtualAddressChange) failed (%r)\r\n", Status);
+        SingularityDebugPrint(AsciiBuffer);
         return Status;
     }
+    SingularityDebugPrint("SingularityDxe:   step 6/7 VirtualAddressChange event registered\r\n");
 
     Status = gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY,
                                 ExitBootServicesEvent, NULL,
                                 &gEfiEventExitBootServicesGuid, &ExitEvent);
-    if (EFI_ERROR(Status)) return Status;
+    if (EFI_ERROR(Status)) {
+        AsciiSPrint(AsciiBuffer, sizeof(AsciiBuffer),
+                    "SingularityDxe: CreateEventEx(ExitBootServices) failed (%r)\r\n", Status);
+        SingularityDebugPrint(AsciiBuffer);
+        return Status;
+    }
+    SingularityDebugPrint("SingularityDxe:   step 7/7 ExitBootServices event registered\r\n");
 
     SingularityDebugPrint("SingularityDxe: loaded\r\n");
     return EFI_SUCCESS;
