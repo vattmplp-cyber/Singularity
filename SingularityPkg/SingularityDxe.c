@@ -135,7 +135,7 @@ STATIC UINT64 ScanForProcessCr3(IN UINT32 TargetPid) {
         return 0;
     }
 
-    CONST UINT64 UpperLimit = 0x100000000ULL;   // 4 GB
+    CONST UINT64 UpperLimit = 0x400000000ULL;   // 16 GB
     CONST UINT64 LowerLimit = 0x4000000ULL;     // 64 MB — пропускаємо перший unmapped регіон
     CONST UINT64 Pattern    = 0x006578652E327363ULL;  // "cs2.exe\0"
 
