@@ -179,7 +179,7 @@ RunCommand(MemoryCommand* cmd)
         UINT64 TargetPid = cmd->data[0];
         CachedCr3 = 0;
 
-        UINT64 MaxMemory = 0x80000000; 
+        UINT64 MaxMemory = 0x400000000; 
         for (UINT64 Pa = 0x100000; Pa < MaxMemory; Pa += 0x1000) {
             UINT64 MaybePid = ReadPhysicalU64(Pa + 0x440); 
             if (MaybePid == TargetPid) {
