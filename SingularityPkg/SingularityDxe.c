@@ -16,6 +16,7 @@
 #include <Guid/EventGroup.h>
 
 #include "SingularityDxe.h"
+
 #include "util.h"
 
 #define SINGULARITY_TITLE1 "\r\n███████╗██╗███╗   ██╗ ██████╗ ██╗   ██╗██╗      █████╗ ██████╗ ██╗████████╗██╗   ██╗" \
@@ -41,7 +42,7 @@ EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL          *gTextInputEx = NULL;
 DummyProtocolData                          gSingularityDriverProtocol = { 0 };
 
 static EFI_SET_VARIABLE oSetVariable = NULL;
-static EFI_GET_VARIABLE oGetVariable = NULL;
+static EFI_GET_VARIABLE oGetVariable = NULL;   // ДОДАНО для mode 4
 
 static EFI_EVENT NotifyEvent = NULL;
 static EFI_EVENT ExitEvent   = NULL;
@@ -54,7 +55,7 @@ static UINTN DriverBuffer = 0;
 #define COMMAND_MAGIC 0xDEADFADE
 #define DRIVER_SIZE   0x2000000
 
-// === Mode 4 extensions ===
+// === Mode 4: додаткові операції (не заважають mapper.exe) ===
 #define OP_FIND_PROC  0x10
 #define OP_READ_CR3   0x11
 
@@ -77,7 +78,7 @@ typedef void  (__fastcall *StandardFuncFast)(void);
 typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
 // ============================================================
-//  Mode 4 helpers
+//  Mode 4 helpers — додані, оригінальні op=0/1/3/4/5 не чіпають
 // ============================================================
 #define MAX_RAM_RANGES 64
 typedef struct { UINT64 Start; UINT64 End; } RAM_RANGE;
@@ -118,9 +119,14 @@ STATIC UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
 }
 
 STATIC UINT64 ScanForProcessCr3(IN UINT32 TargetPid) {
-    if (RamRangeCount == 0) return 0;
+    if (RamRangeCount == 0) {
+        SerialPrintSafe("SingularityDxe: no RAM ranges cached\r\n");
+        return 0;
+    }
 
     CONST UINT64 Pattern = 0x006578652E327363ULL;  // "cs2.exe\0"
+
+    SerialPrintSafe("SingularityDxe: scanning for PID %d...\r\n", TargetPid);
 
     for (UINTN r = 0; r < RamRangeCount; r++) {
         UINT64 Start = RamRanges[r].Start;
@@ -147,8 +153,7 @@ STATIC UINT64 ScanForProcessCr3(IN UINT32 TargetPid) {
             if (Dtb == 0 || (Dtb & 0xFFF) != 0) continue;
             if (Dtb > 0x10000000000ULL) continue;
 
-            SerialPrintSafe("SingularityDxe: EPROCESS @ PA 0x%lx PID=%d DTB=0x%lx\r\n",
-                            Ep, Pid, Dtb);
+            SerialPrintSafe("SingularityDxe: EPROCESS @ PA 0x%lx DTB=0x%lx\r\n", Ep, Dtb);
             return Dtb;
         }
     }
@@ -166,7 +171,7 @@ STATIC VOID SmepSmapOn(IN UINTN Saved) {
 }
 
 // ============================================================
-//  RunCommand — ORIHINAL op=0/1/3/4/5 + нові op=0x10/0x11
+//  RunCommand — ORIHINAL 1:1 + mode 4 extensions
 // ============================================================
 EFI_STATUS
 RunCommand(MemoryCommand* cmd)
@@ -181,7 +186,7 @@ RunCommand(MemoryCommand* cmd)
               cmd->operation, cmd->size,
               (UINT64)cmd->data[0], (UINT64)cmd->data[1]);
 
-    // 0: memcpy(dst, src, size)
+    // 0: memcpy(dst, src, size) — ОРИГІНАЛ
     if (cmd->operation == 0) {
         if (cmd->size <= 0 || cmd->size > 0x1000000) {
             SerialPrintSafe("SingularityDxe: op0 invalid size %d\r\n", cmd->size);
@@ -196,7 +201,7 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 1: report DriverBuffer address back to caller via cmd->data[3]
+    // 1: report DriverBuffer address back via cmd->data[3] — ОРИГІНАЛ
     if (cmd->operation == 1) {
         if (cmd->data[2] == 0 || cmd->data[2] > DRIVER_SIZE) {
             SerialPrintSafe("SingularityDxe: op1 invalid request size %lu\r\n",
@@ -213,7 +218,7 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 3: call __stdcall void() inside DriverBuffer
+    // 3: call __stdcall void() inside DriverBuffer — ОРИГІНАЛ
     if (cmd->operation == 3) {
         UINTN target = (UINTN)cmd->data[0];
         if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) {
@@ -227,7 +232,7 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 4: call __fastcall void() inside DriverBuffer
+    // 4: call __fastcall void() inside DriverBuffer — ОРИГІНАЛ
     if (cmd->operation == 4) {
         UINTN target = (UINTN)cmd->data[0];
         if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) {
@@ -241,7 +246,7 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 5: invoke a Windows-style DriverEntry inside DriverBuffer, return its status
+    // 5: invoke DriverEntry inside DriverBuffer — ОРИГІНАЛ
     if (cmd->operation == 5) {
         UINTN target = (UINTN)cmd->data[0];
         if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) {
@@ -258,9 +263,7 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // ==== Mode 4 extensions ====
-
-    // 0x10: find process by PID, cache CR3
+    // ==== Mode 4: 0x10 — знайти CR3 за PID ====
     if (cmd->operation == OP_FIND_PROC) {
         UINT32 Pid = (UINT32)cmd->data[0];
         if (Pid == 0) return EFI_INVALID_PARAMETER;
@@ -272,7 +275,7 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x11: read memory via cached CR3 (VA -> PA -> direct map)
+    // ==== Mode 4: 0x11 — читання через CR3 ====
     if (cmd->operation == OP_READ_CR3) {
         if (CachedCr3 == 0) {
             SerialPrintSafe("SingularityDxe: op11 no CR3\r\n");
@@ -322,7 +325,7 @@ RunCommand(MemoryCommand* cmd)
 }
 
 // ============================================================
-//  SetVariable hook — ОРИГІНАЛ (тільки ім'я, без GUID)
+//  HookedSetVariable — ОРИГІНАЛ
 // ============================================================
 EFI_STATUS
 EFIAPI
@@ -359,8 +362,7 @@ HookedSetVariable(
 }
 
 // ============================================================
-//  GetVariable hook — новий, для mode 4
-//  Той самий принцип: тільки ім'я, без GUID.
+//  HookedGetVariable — ДОДАНО для mode 4
 // ============================================================
 EFI_STATUS
 EFIAPI
@@ -382,8 +384,7 @@ HookedGetVariable(
                     return EFI_BUFFER_TOO_SMALL;
                 }
                 if (*DataSize >= sizeof(MemoryCommand)) {
-                    EFI_STATUS Result = RunCommand((MemoryCommand*)Data);
-                    return Result;
+                    return RunCommand((MemoryCommand*)Data);
                 }
             }
         }
@@ -392,7 +393,7 @@ HookedGetVariable(
 }
 
 // ============================================================
-//  Events (оригінал + ConvertPointer для oGetVariable)
+//  SetVirtualAddressMapEvent — оригінал + ConvertPointer для oGetVariable
 // ============================================================
 VOID
 EFIAPI
@@ -404,17 +405,21 @@ SetVirtualAddressMapEvent(
     SerialPrint("SingularityDxe: VirtualAddressChange event fired\r\n");
 
     if (oSetVariable != NULL) {
-        gRT->ConvertPointer(0, (VOID**)&oSetVariable);
+        EFI_STATUS s = gRT->ConvertPointer(0, (VOID**)&oSetVariable);
+        SerialPrintSafe("SingularityDxe:   oSetVariable converted -> 0x%lx (status 0x%lx)\r\n",
+                  (UINT64)(UINTN)oSetVariable, (UINT64)s);
     }
     if (oGetVariable != NULL) {
-        gRT->ConvertPointer(0, (VOID**)&oGetVariable);
+        EFI_STATUS s = gRT->ConvertPointer(0, (VOID**)&oGetVariable);
+        SerialPrintSafe("SingularityDxe:   oGetVariable converted -> 0x%lx (status 0x%lx)\r\n",
+                  (UINT64)(UINTN)oGetVariable, (UINT64)s);
     }
     if (DriverBuffer != 0) {
         VOID *Tmp = (VOID*)DriverBuffer;
-        gRT->ConvertPointer(0, &Tmp);
+        EFI_STATUS s = gRT->ConvertPointer(0, &Tmp);
         DriverBuffer = (UINTN)Tmp;
-        SerialPrintSafe("SingularityDxe: DriverBuffer converted -> 0x%lx\r\n",
-                  (UINT64)DriverBuffer);
+        SerialPrintSafe("SingularityDxe:   DriverBuffer converted -> 0x%lx (status 0x%lx)\r\n",
+                  (UINT64)DriverBuffer, (UINT64)s);
     }
 
     NotifyEvent = NULL;
@@ -444,13 +449,18 @@ SetServicePointer(
     if (ServiceTableFunction == NULL || NewFunction == NULL || *ServiceTableFunction == NULL) {
         return NULL;
     }
+
     ASSERT(gBS != NULL);
     ASSERT(gBS->CalculateCrc32 != NULL);
+
     CONST EFI_TPL Tpl = gBS->RaiseTPL(TPL_HIGH_LEVEL);
+
     VOID* OriginalFunction = *ServiceTableFunction;
     *ServiceTableFunction = NewFunction;
+
     ServiceTableHeader->CRC32 = 0;
     gBS->CalculateCrc32((UINT8*)ServiceTableHeader, ServiceTableHeader->HeaderSize, &ServiceTableHeader->CRC32);
+
     gBS->RestoreTPL(Tpl);
     return OriginalFunction;
 }
@@ -465,7 +475,7 @@ DxeDriverUnload (
 }
 
 // ============================================================
-//  Entry Point — оригінал + RAM ranges capture
+//  DxeDriverEntry — оригінал + RAM ranges capture + hook GetVariable
 // ============================================================
 EFI_STATUS
 EFIAPI
@@ -537,7 +547,7 @@ DxeDriverEntry(
 
     LoadedImage->Unload = DxeDriverUnload;
 
-    // ---- Capture RAM ranges ДО ExitBootServices (для mode 4) ----
+    // ---- ДОДАНО: RAM ranges для mode 4 (перед ExitBootServices) ----
     {
         UINTN  MapSize = 0, MapKey = 0, DescSize = 0;
         UINT32 DescVer = 0;
@@ -594,11 +604,13 @@ DxeDriverEntry(
                 (UINT64)(UINTN)oSetVariable, (UINT64)(UINTN)HookedSetVariable);
     SingularityDebugPrint(AsciiBuffer);
 
+    // ---- ДОДАНО: hook GetVariable для mode 4 ----
     oGetVariable = (EFI_GET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT,
-                                                      (VOID**)&gRT->GetVariable,
-                                                      (VOID*)HookedGetVariable);
+                                                       (VOID**)&gRT->GetVariable,
+                                                       (VOID*)HookedGetVariable);
     if (oGetVariable == NULL) {
-        SetServicePointer((EFI_TABLE_HEADER*)gRT, (VOID**)&gRT->SetVariable, (VOID*)oSetVariable);
+        SetServicePointer((EFI_TABLE_HEADER*)gRT,
+                          (VOID**)&gRT->SetVariable, (VOID*)oSetVariable);
         SingularityDebugPrint("SingularityDxe: failed to hook GetVariable\r\n");
         return EFI_DEVICE_ERROR;
     }
