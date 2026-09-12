@@ -120,38 +120,60 @@ STATIC UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
 
 STATIC UINT64 ScanForProcessCr3(IN UINT32 TargetPid) {
     if (RamRangeCount == 0) {
-        SerialPrintSafe("SingularityDxe: no RAM ranges cached\r\n");
+        SerialPrintSafe("SingularityDxe: no RAM ranges\r\n");
         return 0;
     }
 
-    CONST UINT64 Pattern = 0x006578652E327363ULL;  // "cs2.exe\0"
+    CONST UINT64 UpperLimit = 0x100000000ULL;   // 4 GB
+    CONST UINT64 LowerLimit = 0x4000000ULL;     // 64 MB — пропускаємо перший unmapped регіон
+    CONST UINT64 Pattern    = 0x006578652E327363ULL;  // "cs2.exe\0"
 
-    SerialPrintSafe("SingularityDxe: scanning for PID %d...\r\n", TargetPid);
+    UINT64 Base = GetDirectMapBase();
+    SerialPrintSafe("SingularityDxe: scan PID=%d, base=0x%lx, start=0x%lx\r\n",
+                    TargetPid, Base, LowerLimit);
 
     for (UINTN r = 0; r < RamRangeCount; r++) {
         UINT64 Start = RamRanges[r].Start;
         UINT64 End   = RamRanges[r].End;
-        if (Start < 0x100000) Start = 0x100000;
-        if (End > 0x800000000ULL) End = 0x800000000ULL;
+        if (Start < LowerLimit) Start = LowerLimit;
+        if (End > UpperLimit)   End   = UpperLimit;
+        if (End <= Start) continue;
         Start &= ~7ULL;
         End   &= ~7ULL;
 
         for (UINT64 Pa = Start; Pa + 8 <= End; Pa += 8) {
-            UINT64 V = *(volatile UINT64 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Pa);
+            UINT64 V = *(volatile UINT64 *)(UINTN)(Base + Pa);
             if (V != Pattern) continue;
 
             if (Pa < 0x5a8) continue;
             UINT64 Ep = Pa - 0x5a8;
             if (Ep & 0xF) continue;
 
-            UINT32 Pid = *(volatile UINT32 *)(UINTN)
-                (WINDOWS_DIRECT_MAP_BASE + Ep + 0x440);
+            // 15-байтове ім'я
+            BOOLEAN NameOk = TRUE;
+            for (int k = 0; k < 15; k++) {
+                UINT8 c = *(volatile UINT8 *)(UINTN)(Base + Ep + 0x5a8 + k);
+                if (c == 0) { if (k < 7) NameOk = FALSE; break; }
+                if (c < 0x20 || c > 0x7E) { NameOk = FALSE; break; }
+            }
+            if (!NameOk) continue;
+
+            UINT32 Pid = *(volatile UINT32 *)(UINTN)(Base + Ep + 0x440);
             if (Pid != TargetPid) continue;
 
-            UINT64 Dtb = *(volatile UINT64 *)(UINTN)
-                (WINDOWS_DIRECT_MAP_BASE + Ep + 0x28);
+            UINT64 Dtb = *(volatile UINT64 *)(UINTN)(Base + Ep + 0x28);
             if (Dtb == 0 || (Dtb & 0xFFF) != 0) continue;
-            if (Dtb > 0x10000000000ULL) continue;
+            if (Dtb > UpperLimit) continue;
+
+            // Перша PTE present
+            UINT64 Pml0 = *(volatile UINT64 *)(UINTN)(Base + Dtb);
+            if ((Pml0 & 1) == 0) continue;
+
+            // Kernel PML4E present (для 4-level)
+            if (!IsLa57()) {
+                UINT64 Pml256 = *(volatile UINT64 *)(UINTN)(Base + Dtb + 256 * 8);
+                if ((Pml256 & 1) == 0) continue;
+            }
 
             SerialPrintSafe("SingularityDxe: EPROCESS @ PA 0x%lx DTB=0x%lx\r\n", Ep, Dtb);
             return Dtb;
