@@ -174,10 +174,28 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x10 — Передати CR3 цільового процесу (cmd->data[0] = CR3)
+    // 0x10 — Отримати PID від клієнта, знайти його CR3 та закешувати
     if (cmd->operation == OP_SET_CR3) {
-        CachedCr3 = cmd->data[0];
-        SerialPrintSafe("SingularityDxe: CR3 set to 0x%lx\r\n", CachedCr3);
+        UINT64 TargetPid = cmd->data[0];
+        CachedCr3 = 0;
+
+        UINT64 MaxMemory = 0x80000000; 
+        for (UINT64 Pa = 0x100000; Pa < MaxMemory; Pa += 0x1000) {
+            UINT64 MaybePid = ReadPhysicalU64(Pa + 0x440); 
+            if (MaybePid == TargetPid) {
+                UINT64 FoundCr3 = ReadPhysicalU64(Pa + 0x28); 
+                if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0) {
+                    CachedCr3 = FoundCr3;
+                    SerialPrintSafe("SingularityDxe: Found PID %d -> CR3 = 0x%lx\r\n", TargetPid, CachedCr3);
+                    break;
+                }
+            }
+        }
+
+        if (CachedCr3 == 0) {
+            SerialPrintSafe("SingularityDxe: Failed to find CR3 for PID %d\r\n", TargetPid);
+            return EFI_NOT_FOUND;
+        }
         return EFI_SUCCESS;
     }
 
