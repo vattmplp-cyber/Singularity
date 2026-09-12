@@ -72,7 +72,7 @@ static UINTN DriverBuffer = 0;
 #define CR4_SMAP (1ULL << 21)
 
 // ============================================================
-//  EPROCESS layouts (по білдах Windows 10/11 x64)
+//  EPROCESS layouts
 // ============================================================
 typedef struct {
     UINT32 PidOff;
@@ -81,11 +81,11 @@ typedef struct {
 } EPROCESS_LAYOUT;
 
 STATIC CONST EPROCESS_LAYOUT KnownLayouts[] = {
-    { 0x440, 0x28, 0x5a8 },   // Win10 2004-22H2 (19041-19045) — основний твій
+    { 0x440, 0x28, 0x5a8 },   // Win10 2004-22H2 (19041-19045)
     { 0x440, 0x28, 0x5a8 },   // Win10 20H2-21H2 (дубль)
     { 0x2e0, 0x28, 0x450 },   // Win10 1809 (17763)
     { 0x2e8, 0x28, 0x450 },   // Win10 1903/1909 (18362/18363)
-    { 0x4b8, 0x28, 0x620 },   // Win11 22H2 (22621) — про запас
+    { 0x4b8, 0x28, 0x620 },   // Win11 22H2 (22621)
 };
 #define NUM_LAYOUTS (sizeof(KnownLayouts)/sizeof(KnownLayouts[0]))
 
@@ -98,28 +98,25 @@ typedef struct _MemoryCommand {
 
 static UINT64 CachedCr3 = 0;
 static UINT32 CachedPid = 0;
-static UINT32 ActivePidOff  = 0;
-static UINT32 ActiveDtbOff  = 0;
-static UINT32 ActiveNameOff = 0;
 
-// RAM ranges (заповнюються до ExitBootServices)
+// RAM ranges
 #define MAX_RAM_RANGES 64
 typedef struct { UINT64 Start; UINT64 End; } RAM_RANGE;
 static RAM_RANGE RamRanges[MAX_RAM_RANGES];
 static UINTN     RamRangeCount = 0;
 
 // ============================================================
-//  SMAP / SMEP (з CLI/STI)
+//  SMAP / SMEP (з правильною SaveAndDisableInterrupts)
 // ============================================================
 STATIC VOID SmepSmapOff(OUT UINTN *Saved, OUT BOOLEAN *IfSaved) {
-    *IfSaved = AsmDisableInterrupts();
+    *IfSaved = SaveAndDisableInterrupts();
     *Saved   = AsmReadCr4();
     AsmWriteCr4(*Saved & ~(CR4_SMEP | CR4_SMAP));
 }
 
 STATIC VOID SmepSmapOn(IN UINTN Saved, IN BOOLEAN IfSaved) {
     AsmWriteCr4(Saved);
-    if (IfSaved) AsmEnableInterrupts();
+    if (IfSaved) EnableInterrupts();
 }
 
 // ============================================================
@@ -156,7 +153,7 @@ STATIC UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
 }
 
 // ============================================================
-//  Сканування EPROCESS по RAM ranges
+//  Сканування EPROCESS
 // ============================================================
 STATIC UINT64 ScanForProcessCr3(IN UINT32 TargetPid) {
     if (RamRangeCount == 0) {
@@ -176,7 +173,7 @@ STATIC UINT64 ScanForProcessCr3(IN UINT32 TargetPid) {
             UINT64 Start = RamRanges[r].Start;
             UINT64 End   = RamRanges[r].End;
             if (Start < 0x100000) Start = 0x100000;
-            if (End > 0x400000000ULL) End = 0x400000000ULL;   // до 16 GB
+            if (End > 0x400000000ULL) End = 0x400000000ULL;
 
             for (UINT64 Pa = Start; Pa + 8 < End; Pa += 16) {
                 UINT64 V = *(volatile UINT64 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Pa);
@@ -195,10 +192,6 @@ STATIC UINT64 ScanForProcessCr3(IN UINT32 TargetPid) {
                 UINT8 c0 = *(volatile UINT8 *)(UINTN)
                     (WINDOWS_DIRECT_MAP_BASE + Ep + NameOff);
                 if (c0 < 0x20 || c0 > 0x7E) continue;
-
-                ActivePidOff  = PidOff;
-                ActiveDtbOff  = DtbOff;
-                ActiveNameOff = NameOff;
 
                 SerialPrintSafe("SingularityDxe: EPROCESS @ PA 0x%lx DTB=0x%lx name='%a' layout=%d\r\n",
                                 Ep, Dtb,
@@ -504,7 +497,9 @@ EFI_STATUS EFIAPI DxeDriverEntry(IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE 
 
     // ---------- Capture RAM ranges ДО ExitBootServices ----------
     {
-        UINTN MapSize = 0, MapKey = 0, DescSize = 0, DescVer = 0;
+        UINTN  MapSize = 0, MapKey = 0, DescSize = 0;
+        UINT32 DescVer = 0;
+
         gBS->GetMemoryMap(&MapSize, NULL, &MapKey, &DescSize, &DescVer);
         MapSize += 4 * DescSize;
 
