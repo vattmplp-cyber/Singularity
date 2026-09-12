@@ -62,6 +62,7 @@ static UINTN DriverBuffer = 0;
 #define WINDOWS_DIRECT_MAP_BASE 0xFFFF800000000000ULL
 #define CR4_SMEP (1ULL << 20)
 #define CR4_SMAP (1ULL << 21)
+#define CR4_LA57 (1ULL << 12)   // ДОДАНО для LA57
 
 typedef struct _MemoryCommand
 {
@@ -88,8 +89,18 @@ static UINTN     RamRangeCount = 0;
 static UINT64 CachedCr3 = 0;
 static UINT32 CachedPid = 0;
 
+// ---- ДОДАНО: LA57 / direct-map base (визначено до ReadPhysicalU64) ----
+STATIC BOOLEAN IsLa57(VOID) {
+    return (AsmReadCr4() & CR4_LA57) != 0;
+}
+
+STATIC UINT64 GetDirectMapBase(VOID) {
+    if (IsLa57()) return 0xFF00000000000000ULL;
+    return WINDOWS_DIRECT_MAP_BASE;
+}
+
 STATIC UINT64 ReadPhysicalU64(IN UINT64 Pa) {
-    return *(volatile UINT64 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Pa);
+    return *(volatile UINT64 *)(UINTN)(GetDirectMapBase() + Pa);
 }
 
 STATIC UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
@@ -331,7 +342,7 @@ RunCommand(MemoryCommand* cmd)
             UINTN PageOff = (UINTN)(CurVa & 0xFFF);
             UINTN ToCopy  = 0x1000 - PageOff;
             if (ToCopy > (Size - Done)) ToCopy = Size - Done;
-            volatile UINT8 *SrcP = (volatile UINT8 *)(UINTN)(WINDOWS_DIRECT_MAP_BASE + Pa);
+            volatile UINT8 *SrcP = (volatile UINT8 *)(UINTN)(GetDirectMapBase() + Pa);
             volatile UINT8 *DstP = (volatile UINT8 *)(UINTN)(DstVa + Done);
             for (UINTN i = 0; i < ToCopy; i++) DstP[i] = SrcP[i];
             Done += ToCopy;
