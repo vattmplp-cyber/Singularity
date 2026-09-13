@@ -1,5 +1,4 @@
 #include <Uefi.h>
-
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiRuntimeServicesTableLib.h>
 #include <Library/BaseLib.h>
@@ -10,19 +9,15 @@
 #include <Library/IoLib.h>
 #include <Library/UefiLib.h>
 #include <Library/PrintLib.h>
-
 #include <Protocol/LoadedImage.h>
-
 #include <Guid/EventGroup.h>
-
 #include "SingularityDxe.h"
-
 #include "util.h"
 
 #define SINGULARITY_TITLE1 "\r\n███████╗██╗███╗   ██╗ ██████╗ ██╗   ██╗██╗      █████╗ ██████╗ ██╗████████╗██╗   ██╗" \
                            "\r\n██╔════╝██║████╗  ██║██╔════╝ ██║   ██║██║     ██╔══██╗██╔══██╗██║╚══██╔══╝╚██╗ ██╔╝" \
                            "\r\n███████╗██║██╔██╗ ██║██║  ███╗██║   ██║██║     ███████║██████╔╝██║   ██║    ╚████╔╝" \
-                           "\r\n╚════██║██║██║╚██╗██║██║   ██║██║   ██║██║     ██╔══██║██╔══██╗██║   ██║     ╚██╔╝" \
+                           "\r\n╚════██║██║██║╚██╗██║██║   ██║██║   ██║██║     ██╔══██║██╔══██║██║   ██║     ╚██╔╝" \
                            "\r\n███████║██║██║ ╚████║╚██████╔╝╚██████╔╝███████╗██║  ██║██║  ██║██║   ██║      ██║" \
                            "\r\n╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝   ╚═╝      ╚═╝"
 #define SINGULARITY_TITLE2 "\r\n                                                                                 " \
@@ -43,12 +38,10 @@ DummyProtocolData                          gSingularityDriverProtocol = { 0 };
 
 static EFI_SET_VARIABLE oSetVariable = NULL;
 static EFI_GET_VARIABLE oGetVariable = NULL;
-
 static EFI_EVENT NotifyEvent = NULL;
 static EFI_EVENT ExitEvent   = NULL;
 static BOOLEAN   Virtual     = FALSE;
 static BOOLEAN   Runtime     = FALSE;
-
 static UINTN DriverBuffer = 0;
 
 #define VARIABLE_NAME L"Singularity42"
@@ -61,6 +54,13 @@ static UINTN DriverBuffer = 0;
 
 #define CR4_SMEP (1ULL << 20)
 #define CR4_SMAP (1ULL << 21)
+
+// x86_64 Пейджингові константи та маски
+#define PRESENT_BIT        (0x0000000000000001ULL)
+#define PAGE_SIZE_BIT      (0x0000000000000080ULL) // Біт PS (завжди 7-й біт)
+#define PHYS_ADDR_MASK_4K  (0x000FFFFFFFFFF000ULL)
+#define PHYS_ADDR_MASK_2M  (0x000FFFFFFFE00000ULL)
+#define PHYS_ADDR_MASK_1G  (0x000FFFFFC0000000ULL)
 
 typedef struct _MemoryCommand
 {
@@ -78,36 +78,48 @@ typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
 static UINT64 CachedCr3 = 0;
 
-// ---- Читання фізичної пам'яті ----
-STATIC UINT64 ReadPhysicalU64(IN UINT64 Pa) {
+// ---- Безпечне читання фізичної пам'яті ----
+STATIC __inline UINT64 ReadPhysicalU64(IN UINT64 Pa) {
     return *(volatile UINT64 *)(UINTN)Pa;
 }
 
-// ---- Чесна трансляція сторінок (Page Table Walk) ----
-STATIC UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
+// ---- Високопродуктивна трансляція сторінок з підтримкою Huge Pages ----
+STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     if (Cr3 == 0) return 0;
 
-    UINT64 i4 = (Va >> 39) & 0x1FF;
-    UINT64 i3 = (Va >> 30) & 0x1FF;
-    UINT64 i2 = (Va >> 21) & 0x1FF;
-    UINT64 i1 = (Va >> 12) & 0x1FF;
-    UINT64 off = Va & 0xFFF;
+    UINT64 Entry;
+    UINT64 PhysBase = Cr3 & PHYS_ADDR_MASK_4K;
 
-    UINT64 e4 = ReadPhysicalU64((Cr3 & 0x000FFFFFFFFFF000ULL) + i4 * 8);
-    if (!(e4 & 1)) return 0;
+    // 1. Рівень PML4
+    Entry = ReadPhysicalU64(PhysBase + (((Va >> 39) & 0x1FF) * 8));
+    if (!(Entry & PRESENT_BIT)) return 0;
+    PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
-    UINT64 e3 = ReadPhysicalU64((e4 & 0x000FFFFFFFFFF000ULL) + i3 * 8);
-    if (!(e3 & 1)) return 0;
-    if (e3 & (1ULL << 7)) return (e3 & 0x000FFFFFC0000000ULL) + (Va & 0x3FFFFFFF);
+    // 2. Рівень PDPT
+    Entry = ReadPhysicalU64(PhysBase + (((Va >> 30) & 0x1FF) * 8));
+    if (!(Entry & PRESENT_BIT)) return 0;
 
-    UINT64 e2 = ReadPhysicalU64((e3 & 0x000FFFFFFFFFF000ULL) + i2 * 8);
-    if (!(e2 & 1)) return 0;
-    if (e2 & (1ULL << 7)) return (e2 & 0x000FFFFFFFE00000ULL) + (Va & 0x1FFFFF);
+    // Обробка гігантських сторінок (1 ГБ)
+    if (Entry & PAGE_SIZE_BIT) {
+        return (Entry & PHYS_ADDR_MASK_1G) | (Va & 0x3FFFFFFFULL);
+    }
+    PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
-    UINT64 e1 = ReadPhysicalU64((e2 & 0x000FFFFFFFFFF000ULL) + i1 * 8);
-    if (!(e1 & 1)) return 0;
+    // 3. Рівень PDT
+    Entry = ReadPhysicalU64(PhysBase + (((Va >> 21) & 0x1FF) * 8));
+    if (!(Entry & PRESENT_BIT)) return 0;
 
-    return (e1 & 0x000FFFFFFFFFF000ULL) + off;
+    // Обробка великих сторінок (2 МБ)
+    if (Entry & PAGE_SIZE_BIT) {
+        return (Entry & PHYS_ADDR_MASK_2M) | (Va & 0x1FFFFFULL);
+    }
+    PhysBase = Entry & PHYS_ADDR_MASK_4K;
+
+    // 4. Рівень PT (Стандартні сторінки 4 КБ)
+    Entry = ReadPhysicalU64(PhysBase + (((Va >> 12) & 0x1FF) * 8));
+    if (!(Entry & PRESENT_BIT)) return 0;
+
+    return (Entry & PHYS_ADDR_MASK_4K) | (Va & 0xFFFULL);
 }
 
 STATIC VOID SmepSmapOff(OUT UINTN *Saved) {
@@ -120,10 +132,9 @@ STATIC VOID SmepSmapOn(IN UINTN Saved) {
 }
 
 // ============================================================
-//  RunCommand — Твоя основна логіка
+//  RunCommand — Основна логіка
 // ============================================================
-EFI_STATUS
-RunCommand(MemoryCommand* cmd)
+EFI_STATUS RunCommand(MemoryCommand* cmd)
 {
     if (cmd->magic != COMMAND_MAGIC) {
         SerialPrintSafe("SingularityDxe: RunCommand bad magic 0x%x\r\n", cmd->magic);
@@ -174,17 +185,18 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x10 — Отримати PID від клієнта, знайти його CR3 та закешувати
+    // 0x10 — Отримати PID від клієнта, знайти його CR3 та закешувати (Windows 10 22H2 зсуви)
     if (cmd->operation == OP_SET_CR3) {
         UINT64 TargetPid = cmd->data[0];
         CachedCr3 = 0;
 
         UINT64 MaxMemory = 0x400000000; 
         for (UINT64 Pa = 0x100000; Pa < MaxMemory; Pa += 0x1000) {
+            // Перевірка тегу пулу 'Proc' (0x636F7250) або сканування полів EPROCESS
             UINT64 MaybePid = ReadPhysicalU64(Pa + 0x440); 
             if (MaybePid == TargetPid) {
                 UINT64 FoundCr3 = ReadPhysicalU64(Pa + 0x28); 
-                if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0) {
+                if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0 && FoundCr3 < 0x100000000ULL) {
                     CachedCr3 = FoundCr3;
                     SerialPrintSafe("SingularityDxe: Found PID %d -> CR3 = 0x%lx\r\n", TargetPid, CachedCr3);
                     break;
@@ -199,7 +211,7 @@ RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x11 — Читання віртуальної пам'яті через CR3
+    // 0x11 — Швидке читання віртуальної пам'яті через CR3
     if (cmd->operation == OP_READ_CR3) {
         if (CachedCr3 == 0) return EFI_NOT_READY;
         if (cmd->size <= 0 || cmd->size > 0x100000) return EFI_INVALID_PARAMETER;
@@ -293,16 +305,15 @@ EFIAPI
 SetVirtualAddressMapEvent(
     IN EFI_EVENT Event,
     IN VOID*     Context
-    )
+)
 {
     if (oSetVariable != NULL) gRT->ConvertPointer(0, (VOID**)&oSetVariable);
     if (oGetVariable != NULL) gRT->ConvertPointer(0, (VOID**)&oGetVariable);
     if (DriverBuffer != 0) {
-        VOID *Tmp = (VOID*)DriverBuffer;
+        VOID *Tmp = (VOID *)DriverBuffer;
         gRT->ConvertPointer(0, &Tmp);
         DriverBuffer = (UINTN)Tmp;
     }
-
     NotifyEvent = NULL;
     Virtual = TRUE;
 }
@@ -312,7 +323,7 @@ EFIAPI
 ExitBootServicesEvent(
     IN EFI_EVENT Event,
     IN VOID*     Context
-    )
+)
 {
     ExitEvent = NULL;
     Runtime = TRUE;
@@ -323,17 +334,14 @@ SetServicePointer(
     IN OUT EFI_TABLE_HEADER *ServiceTableHeader,
     IN OUT VOID **ServiceTableFunction,
     IN VOID *NewFunction
-    )
+)
 {
     if (ServiceTableFunction == NULL || NewFunction == NULL || *ServiceTableFunction == NULL) return NULL;
-
     CONST EFI_TPL Tpl = gBS->RaiseTPL(TPL_HIGH_LEVEL);
     VOID* OriginalFunction = *ServiceTableFunction;
     *ServiceTableFunction = NewFunction;
-
     ServiceTableHeader->CRC32 = 0;
     gBS->CalculateCrc32((UINT8*)ServiceTableHeader, ServiceTableHeader->HeaderSize, &ServiceTableHeader->CRC32);
-
     gBS->RestoreTPL(Tpl);
     return OriginalFunction;
 }
@@ -341,7 +349,7 @@ SetServicePointer(
 EFI_STATUS
 EFIAPI
 DxeDriverUnload (IN EFI_HANDLE ImageHandle) {
-  return EFI_ACCESS_DENIED;
+    return EFI_ACCESS_DENIED;
 }
 
 // ============================================================
@@ -352,7 +360,7 @@ EFIAPI
 DxeDriverEntry(
     IN EFI_HANDLE        ImageHandle,
     IN EFI_SYSTEM_TABLE  *SystemTable
-    )
+)
 {
     EFI_STATUS          Status;
     DummyProtocolData   *ExistingProtocol = NULL;
