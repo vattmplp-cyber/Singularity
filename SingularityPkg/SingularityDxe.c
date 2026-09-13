@@ -211,36 +211,30 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x11 — Швидке читання віртуальної пам'яті через CR3
+// 0x11 — Безпечне читання віртуальної пам'яті з поверненням через буфер
     if (cmd->operation == OP_READ_CR3) {
         if (CachedCr3 == 0) return EFI_NOT_READY;
-        if (cmd->size <= 0 || cmd->size > 0x100000) return EFI_INVALID_PARAMETER;
-        if (cmd->data[0] == 0 || cmd->data[1] == 0) return EFI_INVALID_PARAMETER;
+        // Зменшуємо максимальний ліміт за раз під розмір даних у структурі (наприклад, до 64-80 байт)
+        if (cmd->size <= 0 || cmd->size > 64) return EFI_INVALID_PARAMETER;
+        if (cmd->data[1] == 0) return EFI_INVALID_PARAMETER;
 
-        UINT64 DstVa = cmd->data[0];
         UINT64 SrcVa = cmd->data[1];
         UINTN  Size  = (UINTN)cmd->size;
-        UINTN  Done  = 0;
+        UINT8  *OutPtr = (UINT8*)&cmd->data[2]; // Пишемо прямо у вільне місце масиву data[]
 
         UINTN Saved;
         SmepSmapOff(&Saved);
 
-        while (Done < Size) {
+        for (UINTN Done = 0; Done < Size; Done++) {
             UINT64 CurVa = SrcVa + Done;
             UINT64 Pa = VirtualToPhysical(CachedCr3, CurVa);
             if (Pa == 0) {
                 SmepSmapOn(Saved);
                 return EFI_NOT_FOUND;
             }
-            UINTN PageOff = (UINTN)(CurVa & 0xFFF);
-            UINTN ToCopy  = 0x1000 - PageOff;
-            if (ToCopy > (Size - Done)) ToCopy = Size - Done;
-            
-            volatile UINT8 *SrcP = (volatile UINT8 *)(UINTN)Pa;
-            volatile UINT8 *DstP = (volatile UINT8 *)(UINTN)(DstVa + Done);
-            for (UINTN i = 0; i < ToCopy; i++) DstP[i] = SrcP[i];
-            Done += ToCopy;
+            OutPtr[Done] = *(volatile UINT8 *)(UINTN)Pa;
         }
+        
         SmepSmapOn(Saved);
         return EFI_SUCCESS;
     }
