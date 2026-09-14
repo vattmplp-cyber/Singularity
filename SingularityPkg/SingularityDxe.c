@@ -77,19 +77,16 @@ typedef void  (__fastcall *StandardFuncFast)(void);
 typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
 static UINT64 CachedCr3 = 0;
-static UINT64 WindowsPhysicalMask = 0; // Ваша нова змінна
+static UINT64 WindowsPhysicalMask = 0;
 
-// ---- Автовизначення маски, яку надіслав наш EXE-клієнт ----
 STATIC VOID DetectWindowsMask(IN UINT64 ClientProvidedMask) {
     if (WindowsPhysicalMask != 0) return;
     
-    // Перевіряємо, чи клієнт надіслав легітимну високу адресу ядра Windows
     if ((ClientProvidedMask & 0xffff000000000000ULL) == 0xffff000000000000ULL) {
         WindowsPhysicalMask = ClientProvidedMask;
         SerialPrintSafe("SingularityDxe: Dynamically set Windows Mask from Client = 0x%lx\r\n", WindowsPhysicalMask);
     } else {
-        // Якщо щось пішло не так або клієнт надіслав 0, використовуємо останню відому як запасну
-        WindowsPhysicalMask = 0xffff960000000000ULL; 
+        WindowsPhysicalMask = 0xffffa08000000000ULL; 
     }
 }
 
@@ -97,7 +94,7 @@ STATIC __inline BOOLEAN ReadPhysicalU64Safe(IN UINT64 Pa, OUT UINT64 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
     
     if (Virtual && Runtime) {
-        if (WindowsPhysicalMask == 0) DetectWindowsMask(0); // Ініціалізація запасною маскою, якщо виклик стався раніше
+        if (WindowsPhysicalMask == 0) DetectWindowsMask(0);
         
         UINT64 Va = WindowsPhysicalMask + Pa;
         *Val = *(volatile UINT64 *)(UINTN)Va;
@@ -121,20 +118,16 @@ STATIC __inline BOOLEAN ReadPhysicalU8Safe(IN UINT64 Pa, OUT UINT8 *Val) {
     return TRUE;
 }
 
-
-// ---- Трансляція сторінок з підтримкою Huge Pages та безпечною перевіркою ----
 STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     if (Cr3 == 0) return 0;
 
     UINT64 Entry = 0;
     UINT64 PhysBase = Cr3 & PHYS_ADDR_MASK_4K;
 
-    // 1. Рівень PML4
     if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 39) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
     PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
-    // 2. Рівень PDPT
     if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 30) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
@@ -143,7 +136,6 @@ STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     }
     PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
-    // 3. Рівень PDT
     if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 21) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
@@ -152,7 +144,6 @@ STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     }
     PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
-    // 4. Рівень PT
     if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 12) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
@@ -217,27 +208,23 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x10 — Пошук CR3 за PID з динамічним отриманням маски KASLR від EXE-клієнта
+    // 0x10 — Пошук CR3 за PID
     if (cmd->operation == OP_SET_CR3) {
         UINT64 TargetPid  = cmd->data[0];
-        UINT64 ClientMask = cmd->data[1]; // <-- Отримуємо маску KASLR, яку EXE-клієнт поклав у data[1]
+        UINT64 ClientMask = cmd->data[1];
         CachedCr3 = 0;
 
-        // Оновлюємо функцію DetectWindowsMask, щоб вона прийняла значення від клієнта
-        if (WindowsPhysicalMask == 0) {
-            // Перевіряємо, чи клієнт передав легітимну високу адресу ядра Windows
-            if ((ClientMask & 0xffff000000000000ULL) == 0xffff000000000000ULL) {
-                WindowsPhysicalMask = ClientMask;
-                SerialPrintSafe("SingularityDxe: Successfully set Windows Mask from Client = 0x%lx\r\n", WindowsPhysicalMask);
-            } else {
-                // Якщо щось пішло не так (або клієнт застарілий), використовуємо нашу працездатну маску сесії як запасну
-                WindowsPhysicalMask = 0xffff960000000000ULL;
-                SerialPrintSafe("SingularityDxe: Client mask invalid! Using fallback Mask = 0x%lx\r\n", WindowsPhysicalMask);
-            }
+        if ((ClientMask & 0xffff000000000000ULL) == 0xffff000000000000ULL) {
+            WindowsPhysicalMask = ClientMask;
+        } else {
+            WindowsPhysicalMask = 0xffffa08000000000ULL;
         }
 
-        UINT64 MaxMemory = 0x400000000; 
-        for (UINT64 Pa = 0x100000; Pa < MaxMemory; Pa += 0x1000) {
+        UINT64 MaxMemory = 0x400000000ULL; 
+        
+        // КРИТИЧНИЙ ФІКС: Починаємо сканування з 16 МБ (0x1000000), 
+        // щоб оминути зарезервовані непромаповані ділянки BIOS/MMIO
+        for (UINT64 Pa = 0x1000000ULL; Pa < MaxMemory; Pa += 0x1000) {
             UINT64 MaybePid = 0;
             if (ReadPhysicalU64Safe(Pa + 0x440, &MaybePid) && MaybePid == TargetPid) {
                 UINT64 FoundCr3 = 0;
@@ -258,8 +245,7 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-
-       // 0x11 — Безпечне читання віртуальної пам'яті (Аналог ReadProcessMemory з поверненням байтів)
+    // 0x11 — Безпечне читання віртуальної пам'яті
     if (cmd->operation == OP_READ_CR3) {
         if (CachedCr3 == 0) return EFI_NOT_READY;
         if (cmd->size <= 0 || cmd->size > 64) return EFI_INVALID_PARAMETER;
@@ -267,7 +253,7 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
 
         UINT64 SrcVa = cmd->data[1];
         UINTN  Size  = (UINTN)cmd->size;
-        UINT8  *OutPtr = (UINT8*)&cmd->data[2]; // Пишемо байти результату сюди, EXE-клієнт їх забере
+        UINT8  *OutPtr = (UINT8*)&cmd->data[2];
 
         UINTN Saved;
         SmepSmapOff(&Saved);
@@ -280,7 +266,6 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
                 return EFI_NOT_FOUND;
             }
             
-            // Безпечно зчитуємо байт за знайденою фізичною адресою
             if (!ReadPhysicalU8Safe(Pa, &OutPtr[Done])) {
                 SmepSmapOn(Saved);
                 return EFI_NOT_FOUND;
@@ -294,9 +279,6 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
     return EFI_UNSUPPORTED;
 }
 
-// ============================================================
-//  Хуки SetVariable та GetVariable
-// ============================================================
 EFI_STATUS
 EFIAPI
 HookedSetVariable(
@@ -398,9 +380,6 @@ DxeDriverUnload (IN EFI_HANDLE ImageHandle) {
     return EFI_ACCESS_DENIED;
 }
 
-// ============================================================
-//  Точка входу
-// ============================================================
 EFI_STATUS
 EFIAPI
 DxeDriverEntry(
