@@ -80,18 +80,32 @@ typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
 static UINT64 CachedCr3 = 0;
 
-// ---- Безпечне читання фізичної пам'яті через Windows Direct Map ----
+// ---- Безпечне читання фізичної пам'яті (Сумісне і з UEFI, і з Windows) ----
 STATIC __inline BOOLEAN ReadPhysicalU64Safe(IN UINT64 Pa, OUT UINT64 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
-    UINT64 Va = WINDOWS_PHYSICAL_MASK + Pa;
-    *Val = *(volatile UINT64 *)(UINTN)Va;
+    
+    if (Virtual && Runtime) {
+        // Якщо ми ВЖЕ всередині Windows: використовуємо вікно відображення ядра
+        UINT64 Va = WINDOWS_PHYSICAL_MASK + Pa;
+        *Val = *(volatile UINT64 *)(UINTN)Va;
+    } else {
+        // Якщо ми ЩЕ в BIOS/UEFI: читаємо фізичну адресу напряму
+        *Val = *(volatile UINT64 *)(UINTN)Pa;
+    }
     return TRUE;
 }
 
 STATIC __inline BOOLEAN ReadPhysicalU8Safe(IN UINT64 Pa, OUT UINT8 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
-    UINT64 Va = WINDOWS_PHYSICAL_MASK + Pa;
-    *Val = *(volatile UINT8 *)(UINTN)Va;
+    
+    if (Virtual && Runtime) {
+        // Якщо ми ВЖЕ всередині Windows: додаємо маску для 1 байта
+        UINT64 Va = WINDOWS_PHYSICAL_MASK + Pa;
+        *Val = *(volatile UINT8 *)(UINTN)Va;
+    } else {
+        // Якщо ми ЩЕ в BIOS/UEFI: читаємо 1 байт напряму
+        *Val = *(volatile UINT8 *)(UINTN)Pa;
+    }
     return TRUE;
 }
 
