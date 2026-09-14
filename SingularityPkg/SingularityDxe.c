@@ -78,25 +78,33 @@ typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
 static UINT64 CachedCr3 = 0;
 
-// ---- Безпечне читання фізичної пам'яті ----
-STATIC __inline UINT64 ReadPhysicalU64(IN UINT64 Pa) {
-    return *(volatile UINT64 *)(UINTN)Pa;
+// ---- Безпечне читання фізичної пам'яті (захист від BSOD) ----
+STATIC __inline BOOLEAN ReadPhysicalU64Safe(IN UINT64 Pa, OUT UINT64 *Val) {
+    if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
+    *Val = *(volatile UINT64 *)(UINTN)Pa;
+    return TRUE;
 }
 
-// ---- Високопродуктивна трансляція сторінок з підтримкою Huge Pages ----
+STATIC __inline BOOLEAN ReadPhysicalU8Safe(IN UINT64 Pa, OUT UINT8 *Val) {
+    if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
+    *Val = *(volatile UINT8 *)(UINTN)Pa;
+    return TRUE;
+}
+
+// ---- Високопродуктивна трансляція сторінок з підтримкою Huge Pages та безпечною перевіркою ----
 STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     if (Cr3 == 0) return 0;
 
-    UINT64 Entry;
+    UINT64 Entry = 0;
     UINT64 PhysBase = Cr3 & PHYS_ADDR_MASK_4K;
 
     // 1. Рівень PML4
-    Entry = ReadPhysicalU64(PhysBase + (((Va >> 39) & 0x1FF) * 8));
+    if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 39) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
     PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
     // 2. Рівень PDPT
-    Entry = ReadPhysicalU64(PhysBase + (((Va >> 30) & 0x1FF) * 8));
+    if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 30) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
     // Обробка гігантських сторінок (1 ГБ)
@@ -106,7 +114,7 @@ STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
     // 3. Рівень PDT
-    Entry = ReadPhysicalU64(PhysBase + (((Va >> 21) & 0x1FF) * 8));
+    if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 21) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
     // Обробка великих сторінок (2 МБ)
@@ -116,7 +124,7 @@ STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
     // 4. Рівень PT (Стандартні сторінки 4 КБ)
-    Entry = ReadPhysicalU64(PhysBase + (((Va >> 12) & 0x1FF) * 8));
+    if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 12) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
     return (Entry & PHYS_ADDR_MASK_4K) | (Va & 0xFFFULL);
@@ -192,14 +200,15 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
 
         UINT64 MaxMemory = 0x400000000; 
         for (UINT64 Pa = 0x100000; Pa < MaxMemory; Pa += 0x1000) {
-            // Перевірка тегу пулу 'Proc' (0x636F7250) або сканування полів EPROCESS
-            UINT64 MaybePid = ReadPhysicalU64(Pa + 0x440); 
-            if (MaybePid == TargetPid) {
-                UINT64 FoundCr3 = ReadPhysicalU64(Pa + 0x28); 
-                if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0 && FoundCr3 < 0x100000000ULL) {
-                    CachedCr3 = FoundCr3;
-                    SerialPrintSafe("SingularityDxe: Found PID %d -> CR3 = 0x%lx\r\n", TargetPid, CachedCr3);
-                    break;
+            UINT64 MaybePid = 0;
+            if (ReadPhysicalU64Safe(Pa + 0x440, &MaybePid) && MaybePid == TargetPid) {
+                UINT64 FoundCr3 = 0;
+                if (ReadPhysicalU64Safe(Pa + 0x28, &FoundCr3)) {
+                    if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0 && FoundCr3 < 0x100000000ULL) {
+                        CachedCr3 = FoundCr3;
+                        SerialPrintSafe("SingularityDxe: Found PID %d -> CR3 = 0x%lx\r\n", TargetPid, CachedCr3);
+                        break;
+                    }
                 }
             }
         }
@@ -211,16 +220,15 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-// 0x11 — Безпечне читання віртуальної пам'яті з поверненням через буфер
+    // 0x11 — Безпечне читання віртуальної пам'яті з перевіркою сторінок (захист від BSOD)
     if (cmd->operation == OP_READ_CR3) {
         if (CachedCr3 == 0) return EFI_NOT_READY;
-        // Зменшуємо максимальний ліміт за раз під розмір даних у структурі (наприклад, до 64-80 байт)
         if (cmd->size <= 0 || cmd->size > 64) return EFI_INVALID_PARAMETER;
         if (cmd->data[1] == 0) return EFI_INVALID_PARAMETER;
 
         UINT64 SrcVa = cmd->data[1];
         UINTN  Size  = (UINTN)cmd->size;
-        UINT8  *OutPtr = (UINT8*)&cmd->data[2]; // Пишемо прямо у вільне місце масиву data[]
+        UINT8  *OutPtr = (UINT8*)&cmd->data[2];
 
         UINTN Saved;
         SmepSmapOff(&Saved);
@@ -228,11 +236,13 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         for (UINTN Done = 0; Done < Size; Done++) {
             UINT64 CurVa = SrcVa + Done;
             UINT64 Pa = VirtualToPhysical(CachedCr3, CurVa);
-            if (Pa == 0) {
+            
+            UINT8 Val = 0;
+            if (!ReadPhysicalU8Safe(Pa, &Val)) {
                 SmepSmapOn(Saved);
-                return EFI_NOT_FOUND;
+                return EFI_NOT_FOUND; // Замість падіння в BSOD повертаємо помилку
             }
-            OutPtr[Done] = *(volatile UINT8 *)(UINTN)Pa;
+            OutPtr[Done] = Val;
         }
         
         SmepSmapOn(Saved);
