@@ -231,7 +231,7 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x11 — Безпечне читання пам'яті процесу
+       // 0x11 — Безпечне читання віртуальної пам'яті (Аналог ReadProcessMemory з поверненням байтів)
     if (cmd->operation == OP_READ_CR3) {
         if (CachedCr3 == 0) return EFI_NOT_READY;
         if (cmd->size <= 0 || cmd->size > 64) return EFI_INVALID_PARAMETER;
@@ -239,7 +239,7 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
 
         UINT64 SrcVa = cmd->data[1];
         UINTN  Size  = (UINTN)cmd->size;
-        UINT8  *OutPtr = (UINT8*)&cmd->data[2];
+        UINT8  *OutPtr = (UINT8*)&cmd->data[2]; // Пишемо байти результату сюди, EXE-клієнт їх забере
 
         UINTN Saved;
         SmepSmapOff(&Saved);
@@ -247,13 +247,16 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         for (UINTN Done = 0; Done < Size; Done++) {
             UINT64 CurVa = SrcVa + Done;
             UINT64 Pa = VirtualToPhysical(CachedCr3, CurVa);
-            
-            UINT8 Val = 0;
-            if (!ReadPhysicalU8Safe(Pa, &Val)) {
+            if (Pa == 0) {
                 SmepSmapOn(Saved);
                 return EFI_NOT_FOUND;
             }
-            OutPtr[Done] = Val;
+            
+            // Безпечно зчитуємо байт за знайденою фізичною адресою
+            if (!ReadPhysicalU8Safe(Pa, &OutPtr[Done])) {
+                SmepSmapOn(Saved);
+                return EFI_NOT_FOUND;
+            }
         }
         
         SmepSmapOn(Saved);
