@@ -79,29 +79,29 @@ typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 static UINT64 CachedCr3 = 0;
 static UINT64 WindowsPhysicalMask = 0; // Ваша нова змінна
 
-// ---- КРОК 2: Автовизначення маски KASLR вашого ядра Windows 10 ----
-STATIC VOID DetectWindowsMask(VOID) {
+// ---- Автовизначення маски, яку надіслав наш EXE-клієнт ----
+STATIC VOID DetectWindowsMask(IN UINT64 ClientProvidedMask) {
     if (WindowsPhysicalMask != 0) return;
     
-    // Оскільки WinDbg чітко показав, що ваша Windows замапувала RAM за цією адресою,
-    // ми жорстко присвоюємо її тут. Це на 100% захистить ваш ПК від BSOD.
-    WindowsPhysicalMask = 0xffff960000000000ULL; 
-    
-    SerialPrintSafe("SingularityDxe: Dynamically set Windows Mask = 0x%lx\r\n", WindowsPhysicalMask);
+    // Перевіряємо, чи клієнт надіслав легітимну високу адресу ядра Windows
+    if ((ClientProvidedMask & 0xffff000000000000ULL) == 0xffff000000000000ULL) {
+        WindowsPhysicalMask = ClientProvidedMask;
+        SerialPrintSafe("SingularityDxe: Dynamically set Windows Mask from Client = 0x%lx\r\n", WindowsPhysicalMask);
+    } else {
+        // Якщо щось пішло не так або клієнт надіслав 0, використовуємо останню відому як запасну
+        WindowsPhysicalMask = 0xffff960000000000ULL; 
+    }
 }
 
-// ---- КРОК 3: Оновлені функції безпечного читання з підтримкою динамічної маски ----
 STATIC __inline BOOLEAN ReadPhysicalU64Safe(IN UINT64 Pa, OUT UINT64 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
     
     if (Virtual && Runtime) {
-        // Якщо Windows запущена, перевіряємо чи ініціалізована маска
-        if (WindowsPhysicalMask == 0) DetectWindowsMask();
+        if (WindowsPhysicalMask == 0) DetectWindowsMask(0); // Ініціалізація запасною маскою, якщо виклик стався раніше
         
         UINT64 Va = WindowsPhysicalMask + Pa;
         *Val = *(volatile UINT64 *)(UINTN)Va;
     } else {
-        // Якщо ми ще в BIOS/UEFI, читаємо фізичну адресу напряму
         *Val = *(volatile UINT64 *)(UINTN)Pa;
     }
     return TRUE;
@@ -111,17 +111,16 @@ STATIC __inline BOOLEAN ReadPhysicalU8Safe(IN UINT64 Pa, OUT UINT8 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
     
     if (Virtual && Runtime) {
-        // Якщо Windows запущена, перевіряємо чи ініціалізована маска
-        if (WindowsPhysicalMask == 0) DetectWindowsMask();
+        if (WindowsPhysicalMask == 0) DetectWindowsMask(0);
         
         UINT64 Va = WindowsPhysicalMask + Pa;
         *Val = *(volatile UINT8 *)(UINTN)Va;
     } else {
-        // Якщо ми ще в BIOS/UEFI, читаємо 1 байт напряму
         *Val = *(volatile UINT8 *)(UINTN)Pa;
     }
     return TRUE;
 }
+
 
 // ---- Трансляція сторінок з підтримкою Huge Pages та безпечною перевіркою ----
 STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
@@ -218,10 +217,24 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x10 — Пошук CR3 за PID
+    // 0x10 — Пошук CR3 за PID з динамічним отриманням маски KASLR від EXE-клієнта
     if (cmd->operation == OP_SET_CR3) {
-        UINT64 TargetPid = cmd->data[0];
+        UINT64 TargetPid  = cmd->data[0];
+        UINT64 ClientMask = cmd->data[1]; // <-- Отримуємо маску KASLR, яку EXE-клієнт поклав у data[1]
         CachedCr3 = 0;
+
+        // Оновлюємо функцію DetectWindowsMask, щоб вона прийняла значення від клієнта
+        if (WindowsPhysicalMask == 0) {
+            // Перевіряємо, чи клієнт передав легітимну високу адресу ядра Windows
+            if ((ClientMask & 0xffff000000000000ULL) == 0xffff000000000000ULL) {
+                WindowsPhysicalMask = ClientMask;
+                SerialPrintSafe("SingularityDxe: Successfully set Windows Mask from Client = 0x%lx\r\n", WindowsPhysicalMask);
+            } else {
+                // Якщо щось пішло не так (або клієнт застарілий), використовуємо нашу працездатну маску сесії як запасну
+                WindowsPhysicalMask = 0xffff960000000000ULL;
+                SerialPrintSafe("SingularityDxe: Client mask invalid! Using fallback Mask = 0x%lx\r\n", WindowsPhysicalMask);
+            }
+        }
 
         UINT64 MaxMemory = 0x400000000; 
         for (UINT64 Pa = 0x100000; Pa < MaxMemory; Pa += 0x1000) {
@@ -244,6 +257,7 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         }
         return EFI_SUCCESS;
     }
+
 
        // 0x11 — Безпечне читання віртуальної пам'яті (Аналог ReadProcessMemory з поверненням байтів)
     if (cmd->operation == OP_READ_CR3) {
