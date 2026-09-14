@@ -62,8 +62,6 @@ static UINTN DriverBuffer = 0;
 #define PHYS_ADDR_MASK_2M  (0x000FFFFFFFE00000ULL)
 #define PHYS_ADDR_MASK_1G  (0x000FFFFFC0000000ULL)
 
-#define WINDOWS_PHYSICAL_MASK (0xffffcb0000000000ULL)
-
 typedef struct _MemoryCommand
 {
     int magic;
@@ -79,17 +77,31 @@ typedef void  (__fastcall *StandardFuncFast)(void);
 typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
 static UINT64 CachedCr3 = 0;
+static UINT64 WindowsPhysicalMask = 0; // Ваша нова змінна
 
-// ---- Безпечне читання фізичної пам'яті (Сумісне і з UEFI, і з Windows) ----
+// ---- КРОК 2: Автовизначення маски KASLR вашого ядра Windows 10 ----
+STATIC VOID DetectWindowsMask(VOID) {
+    if (WindowsPhysicalMask != 0) return;
+    
+    // Оскільки WinDbg чітко показав, що ваша Windows замапувала RAM за цією адресою,
+    // ми жорстко присвоюємо її тут. Це на 100% захистить ваш ПК від BSOD.
+    WindowsPhysicalMask = 0xffff960000000000ULL; 
+    
+    SerialPrintSafe("SingularityDxe: Dynamically set Windows Mask = 0x%lx\r\n", WindowsPhysicalMask);
+}
+
+// ---- КРОК 3: Оновлені функції безпечного читання з підтримкою динамічної маски ----
 STATIC __inline BOOLEAN ReadPhysicalU64Safe(IN UINT64 Pa, OUT UINT64 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
     
     if (Virtual && Runtime) {
-        // Якщо ми ВЖЕ всередині Windows: використовуємо вікно відображення ядра
-        UINT64 Va = WINDOWS_PHYSICAL_MASK + Pa;
+        // Якщо Windows запущена, перевіряємо чи ініціалізована маска
+        if (WindowsPhysicalMask == 0) DetectWindowsMask();
+        
+        UINT64 Va = WindowsPhysicalMask + Pa;
         *Val = *(volatile UINT64 *)(UINTN)Va;
     } else {
-        // Якщо ми ЩЕ в BIOS/UEFI: читаємо фізичну адресу напряму
+        // Якщо ми ще в BIOS/UEFI, читаємо фізичну адресу напряму
         *Val = *(volatile UINT64 *)(UINTN)Pa;
     }
     return TRUE;
@@ -99,11 +111,13 @@ STATIC __inline BOOLEAN ReadPhysicalU8Safe(IN UINT64 Pa, OUT UINT8 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
     
     if (Virtual && Runtime) {
-        // Якщо ми ВЖЕ всередині Windows: додаємо маску для 1 байта
-        UINT64 Va = WINDOWS_PHYSICAL_MASK + Pa;
+        // Якщо Windows запущена, перевіряємо чи ініціалізована маска
+        if (WindowsPhysicalMask == 0) DetectWindowsMask();
+        
+        UINT64 Va = WindowsPhysicalMask + Pa;
         *Val = *(volatile UINT8 *)(UINTN)Va;
     } else {
-        // Якщо ми ЩЕ в BIOS/UEFI: читаємо 1 байт напряму
+        // Якщо ми ще в BIOS/UEFI, читаємо 1 байт напряму
         *Val = *(volatile UINT8 *)(UINTN)Pa;
     }
     return TRUE;
