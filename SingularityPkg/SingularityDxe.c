@@ -57,10 +57,12 @@ static UINTN DriverBuffer = 0;
 
 // x86_64 Пейджингові константи та маски
 #define PRESENT_BIT        (0x0000000000000001ULL)
-#define PAGE_SIZE_BIT      (0x0000000000000080ULL) // Біт PS (завжди 7-й біт)
+#define PAGE_SIZE_BIT      (0x0000000000000080ULL) 
 #define PHYS_ADDR_MASK_4K  (0x000FFFFFFFFFF000ULL)
 #define PHYS_ADDR_MASK_2M  (0x000FFFFFFFE00000ULL)
 #define PHYS_ADDR_MASK_1G  (0x000FFFFFC0000000ULL)
+
+#define WINDOWS_PHYSICAL_MASK (0xffffcb0000000000ULL)
 
 typedef struct _MemoryCommand
 {
@@ -78,20 +80,22 @@ typedef unsigned long (__stdcall *DriverEntry)(void* driver, void* registry);
 
 static UINT64 CachedCr3 = 0;
 
-// ---- Безпечне читання фізичної пам'яті (захист від BSOD) ----
+// ---- Безпечне читання фізичної пам'яті через Windows Direct Map ----
 STATIC __inline BOOLEAN ReadPhysicalU64Safe(IN UINT64 Pa, OUT UINT64 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
-    *Val = *(volatile UINT64 *)(UINTN)Pa;
+    UINT64 Va = WINDOWS_PHYSICAL_MASK + Pa;
+    *Val = *(volatile UINT64 *)(UINTN)Va;
     return TRUE;
 }
 
 STATIC __inline BOOLEAN ReadPhysicalU8Safe(IN UINT64 Pa, OUT UINT8 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
-    *Val = *(volatile UINT8 *)(UINTN)Pa;
+    UINT64 Va = WINDOWS_PHYSICAL_MASK + Pa;
+    *Val = *(volatile UINT8 *)(UINTN)Va;
     return TRUE;
 }
 
-// ---- Високопродуктивна трансляція сторінок з підтримкою Huge Pages та безпечною перевіркою ----
+// ---- Трансляція сторінок з підтримкою Huge Pages та безпечною перевіркою ----
 STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     if (Cr3 == 0) return 0;
 
@@ -107,7 +111,6 @@ STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 30) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
-    // Обробка гігантських сторінок (1 ГБ)
     if (Entry & PAGE_SIZE_BIT) {
         return (Entry & PHYS_ADDR_MASK_1G) | (Va & 0x3FFFFFFFULL);
     }
@@ -117,13 +120,12 @@ STATIC __inline UINT64 VirtualToPhysical(IN UINT64 Cr3, IN UINT64 Va) {
     if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 21) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
-    // Обробка великих сторінок (2 МБ)
     if (Entry & PAGE_SIZE_BIT) {
         return (Entry & PHYS_ADDR_MASK_2M) | (Va & 0x1FFFFFULL);
     }
     PhysBase = Entry & PHYS_ADDR_MASK_4K;
 
-    // 4. Рівень PT (Стандартні сторінки 4 КБ)
+    // 4. Рівень PT
     if (!ReadPhysicalU64Safe(PhysBase + (((Va >> 12) & 0x1FF) * 8), &Entry)) return 0;
     if (!(Entry & PRESENT_BIT)) return 0;
 
@@ -149,7 +151,6 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_ACCESS_DENIED;
     }
 
-    // 0: memcpy(dst, src, size)
     if (cmd->operation == 0) {
         if (cmd->size <= 0 || cmd->size > 0x1000000) return EFI_INVALID_PARAMETER;
         if (cmd->data[0] == 0 || cmd->data[1] == 0) return EFI_INVALID_PARAMETER;
@@ -157,7 +158,6 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 1: report DriverBuffer
     if (cmd->operation == 1) {
         if (cmd->data[2] == 0 || cmd->data[2] > DRIVER_SIZE) return EFI_INVALID_PARAMETER;
         if (cmd->data[3] != 0) {
@@ -166,7 +166,6 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 3: call __stdcall
     if (cmd->operation == 3) {
         UINTN target = (UINTN)cmd->data[0];
         if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) return EFI_ACCESS_DENIED;
@@ -174,7 +173,6 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 4: call __fastcall
     if (cmd->operation == 4) {
         UINTN target = (UINTN)cmd->data[0];
         if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) return EFI_ACCESS_DENIED;
@@ -182,7 +180,6 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 5: invoke DriverEntry
     if (cmd->operation == 5) {
         UINTN target = (UINTN)cmd->data[0];
         if (DriverBuffer == 0 || target < DriverBuffer || target >= DriverBuffer + DRIVER_SIZE) return EFI_ACCESS_DENIED;
@@ -193,7 +190,7 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x10 — Отримати PID від клієнта, знайти його CR3 та закешувати (Windows 10 22H2 зсуви)
+    // 0x10 — Пошук CR3 за PID
     if (cmd->operation == OP_SET_CR3) {
         UINT64 TargetPid = cmd->data[0];
         CachedCr3 = 0;
@@ -220,7 +217,7 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         return EFI_SUCCESS;
     }
 
-    // 0x11 — Безпечне читання віртуальної пам'яті з перевіркою сторінок (захист від BSOD)
+    // 0x11 — Безпечне читання пам'яті процесу
     if (cmd->operation == OP_READ_CR3) {
         if (CachedCr3 == 0) return EFI_NOT_READY;
         if (cmd->size <= 0 || cmd->size > 64) return EFI_INVALID_PARAMETER;
@@ -240,7 +237,7 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
             UINT8 Val = 0;
             if (!ReadPhysicalU8Safe(Pa, &Val)) {
                 SmepSmapOn(Saved);
-                return EFI_NOT_FOUND; // Замість падіння в BSOD повертаємо помилку
+                return EFI_NOT_FOUND;
             }
             OutPtr[Done] = Val;
         }
@@ -390,14 +387,12 @@ DxeDriverEntry(
 
     LoadedImage->Unload = DxeDriverUnload;
 
-    // Виділяємо буфер
     Status = gBS->AllocatePool(EfiRuntimeServicesCode, DRIVER_SIZE, &Buf);
     if (!EFI_ERROR(Status) && Buf != NULL) {
         ZeroMem(Buf, DRIVER_SIZE);
         DriverBuffer = (UINTN)Buf;
     }
 
-    // Ставимо хуки
     oSetVariable = (EFI_SET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT, (VOID**)&gRT->SetVariable, (VOID*)HookedSetVariable);
     if (oSetVariable == NULL) return EFI_DEVICE_ERROR;
 
@@ -407,7 +402,6 @@ DxeDriverEntry(
         return EFI_DEVICE_ERROR;
     }
 
-    // Реєструємо івенти
     gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY, SetVirtualAddressMapEvent, NULL, &gEfiEventVirtualAddressChangeGuid, &NotifyEvent);
     gBS->CreateEventEx(EVT_NOTIFY_SIGNAL, TPL_NOTIFY, ExitBootServicesEvent, NULL, &gEfiEventExitBootServicesGuid, &ExitEvent);
 
