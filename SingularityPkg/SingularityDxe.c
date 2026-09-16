@@ -62,6 +62,18 @@ static UINTN DriverBuffer = 0;
 #define PHYS_ADDR_MASK_2M  (0x000FFFFFFFE00000ULL)
 #define PHYS_ADDR_MASK_1G  (0x000FFFFFC0000000ULL)
 
+// === НОВІ ЗМІННІ ДЛЯ БЕЗПЕЧНОЇ КАРТИ ПАМ'ЯТІ ===
+#define MAX_MEMORY_RANGES 256
+#define EFI_PAGE_SIZE_ 4096 
+
+typedef struct {
+    UINT64 PhysicalStart;
+    UINT64 PhysicalEnd;
+} MEMORY_RANGE;
+
+static MEMORY_RANGE SafeMemoryRanges[MAX_MEMORY_RANGES];
+static UINTN        SafeMemoryRangeCount = 0;
+
 typedef struct _MemoryCommand
 {
     int magic;
@@ -159,6 +171,44 @@ STATIC VOID SmepSmapOn(IN UINTN Saved) {
     AsmWriteCr4(Saved);
 }
 
+// === НОВА ФУНКЦІЯ: Збір безпечних ділянок пам'яті ===
+STATIC VOID CollectSafeMemoryRanges(VOID) {
+    UINTN MemoryMapSize = 0;
+    EFI_MEMORY_DESCRIPTOR *MemoryMap = NULL;
+    UINTN MapKey;
+    UINTN DescriptorSize;
+    UINT32 DescriptorVersion;
+
+    gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
+    MemoryMapSize += DescriptorSize * 16;
+    
+    if (gBS->AllocatePool(EfiBootServicesData, MemoryMapSize, (VOID**)&MemoryMap) != EFI_SUCCESS) {
+        SerialPrintSafe("SingularityDxe: Failed to allocate pool for Memory Map\r\n");
+        return;
+    }
+
+    if (gBS->GetMemoryMap(&MemoryMapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion) == EFI_SUCCESS) {
+        UINTN NumEntries = MemoryMapSize / DescriptorSize;
+        EFI_MEMORY_DESCRIPTOR *Entry = MemoryMap;
+
+        for (UINTN i = 0; i < NumEntries; i++) {
+            if (Entry->Type == EfiConventionalMemory) {
+                if (SafeMemoryRangeCount < MAX_MEMORY_RANGES) {
+                    SafeMemoryRanges[SafeMemoryRangeCount].PhysicalStart = Entry->PhysicalStart;
+                    SafeMemoryRanges[SafeMemoryRangeCount].PhysicalEnd = Entry->PhysicalStart + (Entry->NumberOfPages * EFI_PAGE_SIZE_);
+                    SafeMemoryRangeCount++;
+                }
+            }
+            Entry = (EFI_MEMORY_DESCRIPTOR*)((UINT8*)Entry + DescriptorSize);
+        }
+        SerialPrintSafe("SingularityDxe: Saved %d safe memory ranges\r\n", SafeMemoryRangeCount);
+    } else {
+        SerialPrintSafe("SingularityDxe: Failed to get Memory Map\r\n");
+    }
+
+    gBS->FreePool(MemoryMap);
+}
+
 // ============================================================
 //  RunCommand — Основна логіка
 // ============================================================
@@ -220,22 +270,29 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
             WindowsPhysicalMask = 0xffffa08000000000ULL;
         }
 
-        UINT64 MaxMemory = 0x400000000ULL; 
-        
-        // КРИТИЧНИЙ ФІКС: Починаємо сканування з 16 МБ (0x1000000), 
-        // щоб оминути зарезервовані непромаповані ділянки BIOS/MMIO
-        for (UINT64 Pa = 0x1000000ULL; Pa < MaxMemory; Pa += 0x1000) {
-            UINT64 MaybePid = 0;
-            if (ReadPhysicalU64Safe(Pa + 0x440, &MaybePid) && MaybePid == TargetPid) {
-                UINT64 FoundCr3 = 0;
-                if (ReadPhysicalU64Safe(Pa + 0x28, &FoundCr3)) {
-                    if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0 && FoundCr3 < 0x100000000ULL) {
-                        CachedCr3 = FoundCr3;
-                        SerialPrintSafe("SingularityDxe: Found PID %d -> CR3 = 0x%lx\r\n", TargetPid, CachedCr3);
-                        break;
+        // ОНОВЛЕНИЙ АЛГОРИТМ: Скануємо тільки збережені безпечні ділянки (EfiConventionalMemory)
+        for (UINTN i = 0; i < SafeMemoryRangeCount; i++) {
+            UINT64 RangeStart = SafeMemoryRanges[i].PhysicalStart;
+            UINT64 RangeEnd   = SafeMemoryRanges[i].PhysicalEnd;
+            
+            // Залишаємо відступ 16 МБ для безпеки від старих зарезервованих ділянок
+            if (RangeEnd <= 0x1000000ULL) continue;
+            if (RangeStart < 0x1000000ULL) RangeStart = 0x1000000ULL;
+
+            for (UINT64 Pa = RangeStart; Pa < RangeEnd; Pa += 0x1000) {
+                UINT64 MaybePid = 0;
+                if (ReadPhysicalU64Safe(Pa + 0x440, &MaybePid) && MaybePid == TargetPid) {
+                    UINT64 FoundCr3 = 0;
+                    if (ReadPhysicalU64Safe(Pa + 0x28, &FoundCr3)) {
+                        if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0 && FoundCr3 < 0x100000000ULL) {
+                            CachedCr3 = FoundCr3;
+                            SerialPrintSafe("SingularityDxe: Found PID %d -> CR3 = 0x%lx\r\n", TargetPid, CachedCr3);
+                            break;
+                        }
                     }
                 }
             }
+            if (CachedCr3 != 0) break; // Якщо знайшли CR3 - припиняємо сканування
         }
 
         if (CachedCr3 == 0) {
@@ -416,6 +473,9 @@ DxeDriverEntry(
         ZeroMem(Buf, DRIVER_SIZE);
         DriverBuffer = (UINTN)Buf;
     }
+
+    // ВИКЛИК ФУНКЦІЇ ДО ПІДМІНИ ВКАЗІВНИКІВ
+    CollectSafeMemoryRanges();
 
     oSetVariable = (EFI_SET_VARIABLE)SetServicePointer((EFI_TABLE_HEADER*)gRT, (VOID**)&gRT->SetVariable, (VOID*)HookedSetVariable);
     if (oSetVariable == NULL) return EFI_DEVICE_ERROR;
