@@ -116,6 +116,37 @@ STATIC __inline BOOLEAN ReadPhysicalU64Safe(IN UINT64 Pa, OUT UINT64 *Val) {
     return TRUE;
 }
 
+STATIC BOOLEAN IsVaPresent(UINT64 Va, UINT64 DirectMapBase) {
+    if (DirectMapBase == 0) return FALSE;
+    
+    UINT64 Cr3 = AsmReadCr3() & 0x000FFFFFFFFFF000ULL;
+    UINT64 Entry = 0;
+
+    // 1. PML4
+    UINT64 Pml4Va = DirectMapBase + Cr3;
+    Entry = *(volatile UINT64 *)(UINTN)(Pml4Va + (((Va >> 39) & 0x1FF) * 8));
+    if (!(Entry & 1)) return FALSE;
+
+    // 2. PDPT
+    UINT64 PdptVa = DirectMapBase + (Entry & 0x000FFFFFFFFFF000ULL);
+    Entry = *(volatile UINT64 *)(UINTN)(PdptVa + (((Va >> 30) & 0x1FF) * 8));
+    if (!(Entry & 1)) return FALSE;
+    if (Entry & 0x80) return TRUE; // 1GB сторінка
+
+    // 3. PD
+    UINT64 PdVa = DirectMapBase + (Entry & 0x000FFFFFFFFFF000ULL);
+    Entry = *(volatile UINT64 *)(UINTN)(PdVa + (((Va >> 21) & 0x1FF) * 8));
+    if (!(Entry & 1)) return FALSE;
+    if (Entry & 0x80) return TRUE; // 2MB сторінка
+
+    // 4. PT
+    UINT64 PtVa = DirectMapBase + (Entry & 0x000FFFFFFFFFF000ULL);
+    Entry = *(volatile UINT64 *)(UINTN)(PtVa + (((Va >> 12) & 0x1FF) * 8));
+    if (!(Entry & 1)) return FALSE;
+
+    return TRUE;
+}
+
 STATIC __inline BOOLEAN ReadPhysicalU8Safe(IN UINT64 Pa, OUT UINT8 *Val) {
     if (Pa == 0 || Pa > 0x000FFFFFFFFFF000ULL) return FALSE;
     
@@ -271,29 +302,42 @@ EFI_STATUS RunCommand(MemoryCommand* cmd)
         }
 
         // ОНОВЛЕНИЙ АЛГОРИТМ: Скануємо тільки збережені безпечні ділянки (EfiConventionalMemory)
-        for (UINTN i = 0; i < SafeMemoryRangeCount; i++) {
-            UINT64 RangeStart = SafeMemoryRanges[i].PhysicalStart;
-            UINT64 RangeEnd   = SafeMemoryRanges[i].PhysicalEnd;
-            
-            // Залишаємо відступ 16 МБ для безпеки від старих зарезервованих ділянок
-            if (RangeEnd <= 0x1000000ULL) continue;
-            if (RangeStart < 0x1000000ULL) RangeStart = 0x1000000ULL;
+// ... (початок блоку OP_SET_CR3)
 
-            for (UINT64 Pa = RangeStart; Pa < RangeEnd; Pa += 0x1000) {
-                UINT64 MaybePid = 0;
-                if (ReadPhysicalU64Safe(Pa + 0x440, &MaybePid) && MaybePid == TargetPid) {
-                    UINT64 FoundCr3 = 0;
-                    if (ReadPhysicalU64Safe(Pa + 0x28, &FoundCr3)) {
-                        if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0 && FoundCr3 < 0x100000000ULL) {
-                            CachedCr3 = FoundCr3;
-                            SerialPrintSafe("SingularityDxe: Found PID %d -> CR3 = 0x%lx\r\n", TargetPid, CachedCr3);
-                            break;
-                        }
-                    }
+for (UINTN i = 0; i < SafeMemoryRangeCount; i++) {
+    UINT64 RangeStart = SafeMemoryRanges[i].PhysicalStart;
+    UINT64 RangeEnd   = SafeMemoryRanges[i].PhysicalEnd;
+    
+    if (RangeEnd <= 0x1000000ULL) continue;
+    if (RangeStart < 0x1000000ULL) RangeStart = 0x1000000ULL;
+
+    for (UINT64 Pa = RangeStart; Pa < RangeEnd; Pa += 0x1000) {
+        
+        // НОВА ПЕРЕВІРКА: Обчислюємо віртуальну адресу для перевірки
+        UINT64 VaToCheck = WindowsPhysicalMask + Pa;
+        
+        // Якщо сторінки не існує в таблицях процесора - просто йдемо далі!
+        if (!IsVaPresent(VaToCheck, WindowsPhysicalMask)) {
+            continue; 
+        }
+
+        // Тепер читання на 100% безпечне, BSOD не буде
+        UINT64 MaybePid = 0;
+        if (ReadPhysicalU64Safe(Pa + 0x440, &MaybePid) && MaybePid == TargetPid) {
+            UINT64 FoundCr3 = 0;
+            if (ReadPhysicalU64Safe(Pa + 0x28, &FoundCr3)) {
+                if ((FoundCr3 & 0xFFF) == 0 && FoundCr3 != 0 && FoundCr3 < 0x100000000ULL) {
+                    CachedCr3 = FoundCr3;
+                    SerialPrintSafe("SingularityDxe: Found PID %d -> CR3 = 0x%lx\r\n", TargetPid, CachedCr3);
+                    break;
                 }
             }
-            if (CachedCr3 != 0) break; // Якщо знайшли CR3 - припиняємо сканування
         }
+    }
+    if (CachedCr3 != 0) break;
+}
+
+// ... (кінець блоку)
 
         if (CachedCr3 == 0) {
             SerialPrintSafe("SingularityDxe: Failed to find CR3 for PID %d\r\n", TargetPid);
